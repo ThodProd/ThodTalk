@@ -1,6 +1,6 @@
 [package]
 name = "thodtalk"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2024"
 
 [dependencies]
@@ -18,6 +18,13 @@ openmls_basic_credential = "=0.6.0"
 openmls_traits = "=0.6.0"
 tls_codec = "0.5"
 zeroize = "1"
+iroh = "=1.4.1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "io-util", "net"] }
+base64 = "0.22"
+subtle = "2"
+socket2 = "0.6"
+cpal = "0.15"
+opus = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
@@ -26,4 +33,15 @@ windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Wi
 strip = true
 lto = "thin"
 codegen-units = 1
+
+[build-dependencies]
+resvg = { version = "0.45", default-features = false }
+winres = "0.1"
+
+[patch.crates-io]
+# The upstream cdylib exceeds the Windows GNU PE export limit. We only use rlib.
+iroh = { path = "vendor/iroh" }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

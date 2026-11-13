@@ -1,4 +1,7 @@
 $ErrorActionPreference = 'Stop'
+$env:CMAKE_GENERATOR = 'MinGW Makefiles'
+$env:CMAKE_POLICY_VERSION_MINIMUM = '3.5'
+$env:CFLAGS = '-std=c11'
 $env:Path = "$env:USERPROFILE\.cargo\bin;" + [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + [Environment]::GetEnvironmentVariable('Path', 'Machine')
 Push-Location (Join-Path $PSScriptRoot '..')
 try {

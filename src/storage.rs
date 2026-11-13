@@ -19,6 +19,8 @@ pub struct Profile {
     pub output_device: String,
     #[serde(default)]
     pub push_to_talk: bool,
+    #[serde(default = "default_ptt_key")]
+    pub ptt_key: String,
     #[serde(default)]
     pub light_theme: bool,
 }
@@ -29,14 +31,19 @@ impl Default for Profile {
             id: uuid::Uuid::new_v4(),
             name: String::new(),
             avatar: Vec::new(),
-            microphone_allowed: false,
-            network_allowed: false,
+            microphone_allowed: true,
+            network_allowed: true,
             input_device: String::new(),
             output_device: String::new(),
             push_to_talk: false,
+            ptt_key: default_ptt_key(),
             light_theme: false,
         }
     }
+}
+
+fn default_ptt_key() -> String {
+    "F8".into()
 }
 
 impl Profile {

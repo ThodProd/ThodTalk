@@ -30,6 +30,7 @@ struct App {
     muted: bool,
     deafened: bool,
     ptt: bool,
+    choosing_ptt_key: bool,
     input_device: String,
     output_device: String,
     inputs: Vec<String>,
@@ -74,6 +75,7 @@ impl App {
             muted: false,
             deafened: false,
             ptt: false,
+            choosing_ptt_key: false,
             input_device: String::new(),
             output_device: String::new(),
             inputs,
@@ -94,6 +96,8 @@ impl App {
         app.input_device = app.profile.input_device.clone();
         app.output_device = app.profile.output_device.clone();
         app.ptt = app.profile.push_to_talk;
+        app.profile.network_allowed = true;
+        app.profile.microphone_allowed = true;
         ui::theme(&cc.egui_ctx, app.profile.light_theme);
         app.update_avatar(&cc.egui_ctx);
         app
@@ -168,7 +172,8 @@ impl App {
                 disconnected = true;
             }
             if let Some(audio) = &mut self.audio {
-                let held = ctx.input(|i| i.key_down(egui::Key::F8));
+                let key = egui::Key::from_name(&self.profile.ptt_key).unwrap_or(egui::Key::F8);
+                let held = !self.choosing_ptt_key && ctx.input(|i| i.key_down(key));
                 let enabled = !self.muted && !self.deafened && (!self.ptt || held);
                 audio.transmitting.store(enabled, Ordering::Relaxed);
                 audio.deafened.store(self.deafened, Ordering::Relaxed);
@@ -251,7 +256,7 @@ impl App {
         ui.add_sized(
             [ui.available_width(), 44.0],
             egui::TextEdit::singleline(&mut self.profile.name)
-                .hint_text("Как к вам обращаться")
+                .hint_text(ui::hint("Как к вам обращаться", !ui.visuals().dark_mode))
                 .char_limit(40)
                 .margin(egui::vec2(12.0, 12.0)),
         );
@@ -259,16 +264,7 @@ impl App {
         ui.separator();
         ui.add_space(12.0);
         ui.label(ui::heading("Подключение и звук", 18.0));
-        ui.checkbox(
-            &mut self.profile.network_allowed,
-            "Разрешить сеть для общения с друзьями",
-        );
-        ui.small("Бесплатные узлы iroh видят сетевые адреса, но не содержимое переписки и голоса.");
-        ui.checkbox(
-            &mut self.profile.microphone_allowed,
-            "Разрешить микрофон для голосового чата",
-        );
-        ui.small("Микрофон открывается после «Войти в голос». Рекомендуются наушники.");
+        ui.small("Микрофон включается только после входа в голос.");
         egui::ComboBox::from_label("Микрофон")
             .selected_text(if self.input_device.is_empty() {
                 "По умолчанию"
@@ -293,10 +289,43 @@ impl App {
                     ui.selectable_value(&mut self.output_device, name.clone(), name);
                 }
             });
-        ui.checkbox(
-            &mut self.ptt,
-            "Говорить при удержании F8 (окно должно быть активно)",
-        );
+        ui.checkbox(&mut self.ptt, "Говорить при удержании клавиши");
+        if self.ptt {
+            ui.horizontal(|ui| {
+                ui.label("Клавиша:");
+                if ui
+                    .button(if self.choosing_ptt_key {
+                        "Нажмите клавишу…"
+                    } else {
+                        &self.profile.ptt_key
+                    })
+                    .clicked()
+                {
+                    self.choosing_ptt_key = true;
+                }
+                ui.small("В активном окне · Esc — отмена");
+            });
+            if self.choosing_ptt_key {
+                let key = ui.input(|i| {
+                    i.events.iter().find_map(|event| match event {
+                        egui::Event::Key {
+                            key,
+                            physical_key,
+                            pressed: true,
+                            repeat: false,
+                            ..
+                        } => Some(physical_key.unwrap_or(*key)),
+                        _ => None,
+                    })
+                });
+                if let Some(key) = key {
+                    if key != egui::Key::Escape {
+                        self.profile.ptt_key = key.name().into();
+                    }
+                    self.choosing_ptt_key = false;
+                }
+            }
+        }
         if ui
             .checkbox(&mut self.profile.light_theme, "Светлая тема")
             .changed()
@@ -365,7 +394,7 @@ impl App {
                 ui.add_sized(
                     [ui.available_width(), 46.0],
                     egui::TextEdit::singleline(&mut self.code)
-                        .hint_text("Вставьте код сервера")
+                        .hint_text(ui::hint("Вставьте код сервера", !ui.visuals().dark_mode))
                         .margin(egui::vec2(14.0, 13.0)),
                 );
                 join = ui
@@ -476,11 +505,19 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("#").size(28.0).color(ui::muted(light)));
             ui.heading(&self.channel);
-            ui::badge(ui, "Сквозное шифрование", light);
-            if ui.available_width() > 150.0
-                && ui
-                    .button(format!("Участники · {}", session.members.len()))
-                    .clicked()
+            ui.label(
+                egui::RichText::new("Сквозное шифрование")
+                    .size(11.0)
+                    .color(ui::muted(light)),
+            );
+            if ui
+                .add(
+                    egui::Button::new("👤")
+                        .frame(false)
+                        .min_size(egui::vec2(28.0, 28.0)),
+                )
+                .on_hover_text(format!("Участники: {}", session.members.len()))
+                .clicked()
             {
                 self.show_members = !self.show_members;
             }
@@ -623,7 +660,7 @@ impl App {
                         [width, 50.0],
                         egui::TextEdit::multiline(&mut self.draft)
                             .frame(false)
-                            .hint_text(format!("Написать в #{}", self.channel))
+                            .hint_text(ui::hint(format!("Написать в #{}", self.channel), light))
                             .char_limit(16000),
                     );
                     send = ui
@@ -660,7 +697,6 @@ impl eframe::App for App {
         let mut disconnect = false;
         let mut kick = None;
         let light = self.profile.light_theme;
-        let wide = ctx.screen_rect().width() >= 1100.0;
         egui::SidePanel::left("sidebar")
             .exact_width(224.0)
             .resizable(false)
@@ -724,29 +760,8 @@ impl eframe::App for App {
                             .size(11.0)
                             .color(ui::muted(light)),
                     );
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 38.0],
-                            egui::Button::new("Настройки профиля"),
-                        )
-                        .clicked()
-                    {
-                        self.editing = true;
-                    }
-                    if self.session.is_some()
-                        && ui
-                            .add_sized(
-                                [ui.available_width(), 38.0],
-                                egui::Button::new("Отключиться"),
-                            )
-                            .clicked()
-                    {
-                        disconnect = true;
-                    }
-                    ui.add_space(4.0);
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui::avatar(ui, self.avatar.as_ref(), &self.profile.name, 34.0);
+                    let account = ui.horizontal(|ui| {
+                        ui::avatar(ui, self.avatar.as_ref(), &self.profile.name, 36.0);
                         ui.vertical(|ui| {
                             ui.add(
                                 egui::Label::new(ui::heading(
@@ -760,12 +775,45 @@ impl eframe::App for App {
                                 .truncate(),
                             );
                             ui.label(
-                                egui::RichText::new("На этом компьютере")
+                                egui::RichText::new("Профиль и настройки")
                                     .size(11.0)
                                     .color(ui::muted(light)),
                             );
                         });
                     });
+                    if ui
+                        .interact(
+                            account.response.rect,
+                            ui.id().with("account-settings"),
+                            egui::Sense::click(),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        self.editing = true;
+                    }
+                    ui.add_space(8.0);
+                    if self.session.is_some()
+                        && ui
+                            .add_sized(
+                                [ui.available_width(), 38.0],
+                                egui::Button::new(egui::RichText::new("Отключиться").color(
+                                    if light {
+                                        egui::Color32::from_rgb(160, 70, 80)
+                                    } else {
+                                        egui::Color32::from_rgb(231, 160, 168)
+                                    },
+                                ))
+                                .fill(if light {
+                                    egui::Color32::from_rgb(252, 239, 241)
+                                } else {
+                                    egui::Color32::from_rgb(49, 35, 40)
+                                }),
+                            )
+                            .clicked()
+                    {
+                        disconnect = true;
+                    }
                 });
             });
         if disconnect {
@@ -774,7 +822,7 @@ impl eframe::App for App {
             self.member_textures.clear();
         }
         if let Some(session) = &self.session {
-            if !self.editing && (wide || self.show_members) {
+            if !self.editing && self.show_members {
                 egui::SidePanel::right("members")
                     .exact_width(208.0)
                     .resizable(false)

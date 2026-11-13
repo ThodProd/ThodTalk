@@ -102,24 +102,29 @@ pub fn theme(ctx: &egui::Context, light: bool) {
         &mut style.visuals.widgets.active,
         &mut style.visuals.widgets.open,
     ] {
-        widget.corner_radius = egui::CornerRadius::same(8);
+        widget.corner_radius = egui::CornerRadius::same(16);
         widget.bg_fill = surface(light);
         widget.weak_bg_fill = surface(light);
         widget.fg_stroke = egui::Stroke::new(1.5_f32, text);
-        widget.bg_stroke = egui::Stroke::new(1.0_f32, line);
+        widget.bg_stroke = egui::Stroke::NONE;
     }
-    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, accent(light));
+    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+    style.visuals.widgets.hovered.weak_bg_fill = if light {
+        Color32::from_rgb(237, 239, 244)
+    } else {
+        Color32::from_rgb(43, 45, 51)
+    };
     style.visuals.widgets.active.bg_fill = if light {
         Color32::from_rgb(223, 234, 255)
     } else {
         Color32::from_rgb(42, 58, 83)
     };
     style.visuals.selection.bg_fill = if light {
-        Color32::from_rgb(228, 237, 255)
+        Color32::from_rgb(237, 241, 249)
     } else {
-        Color32::from_rgb(37, 52, 77)
+        Color32::from_rgb(34, 40, 51)
     };
-    style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, accent(light));
+    style.visuals.selection.stroke = egui::Stroke::new(0.0_f32, accent(light));
     style.visuals.window_corner_radius = egui::CornerRadius::same(12);
     style.spacing.item_spacing = egui::vec2(10.0, 12.0);
     style.spacing.button_padding = egui::vec2(16.0, 10.0);
@@ -150,6 +155,11 @@ pub fn primary(text: &str) -> egui::Button<'_> {
         .fill(BLUE)
         .stroke(egui::Stroke::NONE)
         .min_size(egui::vec2(0.0, 44.0))
+}
+pub fn hint(text: impl Into<String>, light: bool) -> RichText {
+    RichText::new(text)
+        .size(13.0)
+        .color(muted(light).gamma_multiply(0.65))
 }
 pub fn section(ui: &mut egui::Ui, text: &str, light: bool) {
     ui.label(RichText::new(text).size(12.0).color(muted(light)));

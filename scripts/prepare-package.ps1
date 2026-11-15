@@ -1,5 +1,14 @@
-param([string]$HubCheckout = 'D:\Every\ThodHUB-contract', [string]$OutputDirectory = '')
+﻿param([string]$HubCheckout = 'D:\Every\ThodHUB-contract', [string]$OutputDirectory = '')
 $ErrorActionPreference = 'Stop'
+function Get-RelativePath([string]$Base, [string]$Path) {
+    $baseFull = [IO.Path]::GetFullPath($Base)
+    if (!$baseFull.EndsWith([IO.Path]::DirectorySeparatorChar)) { $baseFull += [IO.Path]::DirectorySeparatorChar }
+    $pathFull = [IO.Path]::GetFullPath($Path)
+    if ($pathFull.StartsWith($baseFull, [StringComparison]::OrdinalIgnoreCase)) {
+        return $pathFull.Substring($baseFull.Length)
+    }
+    return [IO.Path]::GetFileName($Path)
+}
 $root = Split-Path $PSScriptRoot -Parent
 $env:Path = "$env:USERPROFILE\.cargo\bin;" + [Environment]::GetEnvironmentVariable('Path','User') + ';' + [Environment]::GetEnvironmentVariable('Path','Machine')
 $env:CMAKE_GENERATOR = 'MinGW Makefiles'
@@ -44,7 +53,7 @@ try {
         $index += "$prefix | $($package.license) | $($package.repository)"
         $source = Split-Path $package.manifest_path -Parent
         foreach ($file in Get-ChildItem -LiteralPath $source -File -Recurse | Where-Object { $_.Name -match '(?i)(^|[-_.])(license|licence|copying|notice|ofl|ufl)([-_.]|$)' -or ($_.Directory.Name -eq 'fonts' -and $_.Extension -eq '.txt') }) {
-            $relative = [IO.Path]::GetRelativePath($source,$file.FullName)
+            $relative = Get-RelativePath $source $file.FullName
             $dest = Join-Path (Join-Path $licenses $prefix) $relative
             New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
             Copy-Item -LiteralPath $file.FullName -Destination $dest

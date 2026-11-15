@@ -8,13 +8,31 @@ pub const MAX_FRAME: usize = 1024 * 1024;
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum Packet {
     Ping,
-    Join { package: Vec<u8> },
-    Welcome { recipient: u64, data: Vec<u8> },
-    Commit { data: Vec<u8> },
-    Content { data: Vec<u8> },
-    Pending { connection: u64, package: Vec<u8> },
+    Join {
+        package: Vec<u8>,
+    },
+    Welcome {
+        recipient: u64,
+        data: Vec<u8>,
+    },
+    Commit {
+        data: Vec<u8>,
+    },
+    Content {
+        data: Vec<u8>,
+    },
+    Voice {
+        #[serde(with = "crate::wire::binary")]
+        data: Vec<u8>,
+    },
+    Pending {
+        connection: u64,
+        package: Vec<u8>,
+    },
     Rejected,
-    Disconnect { connection: u64 },
+    Disconnect {
+        connection: u64,
+    },
 }
 
 pub fn write_packet(writer: &mut impl Write, packet: &Packet) -> Result<()> {
@@ -53,5 +71,18 @@ mod tests {
         assert!(read_packet(&mut &bytes[..bytes.len() - 1]).is_err());
         assert!(read_packet(&mut &(u32::MAX.to_be_bytes())[..]).is_err());
         assert!(read_packet(&mut &[0, 0, 0, 0][..]).is_err());
+    }
+}
+
+pub mod binary {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(data: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(data))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        STANDARD
+            .decode(String::deserialize(d)?)
+            .map_err(serde::de::Error::custom)
     }
 }

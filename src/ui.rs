@@ -126,17 +126,17 @@ pub fn theme(ctx: &egui::Context, light: bool) {
     };
     style.visuals.selection.stroke = egui::Stroke::new(0.0_f32, accent(light));
     style.visuals.window_corner_radius = egui::CornerRadius::same(12);
-    style.spacing.item_spacing = egui::vec2(10.0, 12.0);
-    style.spacing.button_padding = egui::vec2(16.0, 10.0);
-    style.spacing.interact_size = egui::vec2(40.0, 40.0);
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.interact_size = egui::vec2(28.0, 28.0);
     style.spacing.icon_width = 18.0;
     style.spacing.icon_spacing = 10.0;
     style
         .text_styles
-        .insert(egui::TextStyle::Body, FontId::proportional(15.0));
+        .insert(egui::TextStyle::Body, FontId::proportional(14.0));
     style
         .text_styles
-        .insert(egui::TextStyle::Button, FontId::proportional(15.0));
+        .insert(egui::TextStyle::Button, FontId::proportional(14.0));
     style
         .text_styles
         .insert(egui::TextStyle::Small, FontId::proportional(12.0));
@@ -154,7 +154,7 @@ pub fn primary(text: &str) -> egui::Button<'_> {
     egui::Button::new(RichText::new(text).color(Color32::WHITE))
         .fill(BLUE)
         .stroke(egui::Stroke::NONE)
-        .min_size(egui::vec2(0.0, 44.0))
+        .min_size(egui::vec2(0.0, 30.0))
 }
 pub fn hint(text: impl Into<String>, light: bool) -> RichText {
     RichText::new(text)
@@ -186,17 +186,4 @@ pub fn avatar(ui: &mut egui::Ui, image: Option<&egui::TextureHandle>, name: &str
             Color32::from_rgb(173, 201, 255),
         );
     }
-}
-pub fn badge(ui: &mut egui::Ui, text: &str, light: bool) {
-    egui::Frame::new()
-        .fill(if light {
-            Color32::from_rgb(235, 242, 255)
-        } else {
-            Color32::from_rgb(34, 46, 65)
-        })
-        .corner_radius(6)
-        .inner_margin(egui::Margin::symmetric(9, 4))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(12.0).color(accent(light)));
-        });
 }

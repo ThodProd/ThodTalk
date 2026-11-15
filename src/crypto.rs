@@ -94,6 +94,7 @@ impl Identity {
             .ciphersuite(SUITE)
             .use_ratchet_tree_extension(true)
             .max_past_epochs(2)
+            .sender_ratchet_configuration(SenderRatchetConfiguration::new(512, 2000))
             .build();
         Ok(MlsGroup::new(
             &self.provider,
@@ -101,6 +102,11 @@ impl Identity {
             &config,
             self.credential.clone(),
         )?)
+    }
+    pub fn package_key(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+        let package = KeyPackageIn::tls_deserialize_exact(bytes)?
+            .validate(self.provider.crypto(), ProtocolVersion::Mls10)?;
+        Ok(package.leaf_node().signature_key().as_slice().to_vec())
     }
     pub fn add(&self, group: &mut MlsGroup, key_package: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         ensure!(
@@ -122,7 +128,10 @@ impl Identity {
         else {
             anyhow::bail!("Ожидалось приглашение MLS");
         };
-        let config = MlsGroupJoinConfig::builder().max_past_epochs(2).build();
+        let config = MlsGroupJoinConfig::builder()
+            .max_past_epochs(2)
+            .sender_ratchet_configuration(SenderRatchetConfiguration::new(512, 2000))
+            .build();
         Ok(
             StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)?
                 .into_group(&self.provider)?,

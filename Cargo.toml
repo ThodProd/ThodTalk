@@ -1,6 +1,6 @@
 [package]
 name = "thodtalk"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -25,6 +25,10 @@ subtle = "2"
 socket2 = "0.6"
 cpal = "0.15"
 opus = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "blocking", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+sha2 = "0.10"
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }

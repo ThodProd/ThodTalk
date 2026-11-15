@@ -58,7 +58,16 @@ impl Relay {
                         }
                     }
                 }
-                while let Ok(packet) = control.incoming.try_recv() {
+                let mut failed = Vec::new();
+                loop {
+                    let packet = match control.incoming.try_recv() {
+                        Ok(p) => p,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(_) => {
+                            stopped.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    };
                     match packet {
                         Ok(Packet::Welcome { recipient, data }) => {
                             if let Some(peer) = peers.get_mut(&recipient) {
@@ -73,10 +82,16 @@ impl Relay {
                         Ok(Packet::Disconnect { connection }) => {
                             peers.remove(&connection);
                         }
-                        Ok(packet @ (Packet::Commit { .. } | Packet::Content { .. })) => {
-                            peers.retain(|_, peer| {
-                                !peer.admitted || peer.connection.send(packet.clone()).is_ok()
-                            });
+                        Ok(
+                            packet @ (Packet::Commit { .. }
+                            | Packet::Content { .. }
+                            | Packet::Voice { .. }),
+                        ) => {
+                            for (&id, peer) in &peers {
+                                if peer.admitted && peer.connection.send(packet.clone()).is_err() {
+                                    failed.push(id);
+                                }
+                            }
                         }
                         Err(_) => {
                             stopped.store(true, Ordering::Relaxed);
@@ -86,7 +101,7 @@ impl Relay {
                     }
                 }
                 let mut forward = Vec::new();
-                let mut departed = Vec::new();
+                let mut departed = failed;
                 for (&id, peer) in peers.iter_mut() {
                     if !peer.admitted && peer.since.elapsed() > Duration::from_secs(60) {
                         departed.push(id);
@@ -94,8 +109,13 @@ impl Relay {
                     }
                     // Bound work per tick so a flooding peer cannot starve everyone.
                     for _ in 0..8 {
-                        let Ok(packet) = peer.connection.incoming.try_recv() else {
-                            break;
+                        let packet = match peer.connection.incoming.try_recv() {
+                            Ok(p) => p,
+                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                            Err(_) => {
+                                departed.push(id);
+                                break;
+                            }
                         };
                         match packet {
                             Ok(Packet::Join { package })
@@ -112,7 +132,9 @@ impl Relay {
                                     departed.push(id);
                                 }
                             }
-                            Ok(packet @ Packet::Content { .. }) if peer.admitted => {
+                            Ok(packet @ (Packet::Content { .. } | Packet::Voice { .. }))
+                                if peer.admitted =>
+                            {
                                 forward.push((id, packet))
                             }
                             _ => {

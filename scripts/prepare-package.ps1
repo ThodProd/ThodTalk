@@ -59,7 +59,7 @@ try {
     Copy-Item (Join-Path $sysroot 'share/doc/rust/licenses') $runtimeNotices -Recurse
     Copy-Item (Join-Path $sysroot 'share/doc/COPYING.RUNTIME'),(Join-Path $sysroot 'share/doc/COPYING3') $runtimeNotices
     $output = if ($OutputDirectory) {$OutputDirectory} else {Join-Path $root ('dist/' + $manifest.version)}
-    & (Join-Path $HubCheckout 'scripts/package-module.ps1') -PackageDirectory $stage -Repository 'ThodProd/ThodTalk' -OutputDirectory $output -Notes 'Локальная сборка: профиль, шифрованные чаты и голос, общий код сессии, кик и закрытие входа. Не опубликована.'
+    & (Join-Path $HubCheckout 'scripts/package-module.ps1') -PackageDirectory $stage -Repository 'ThodProd/ThodTalk' -OutputDirectory $output -Notes 'Компактный интерфейс, Enter и изображения в чате, карточки участников и бан на сессию, настройки клавиш и GitHub-обновления. Голос через MLS/QUIC DATAGRAM; проверка живого владельца.'
     if ($LASTEXITCODE) {throw 'Проверка пакета не пройдена'}
     Write-Output "Каталог пакета: $stage"
 } finally {Pop-Location}

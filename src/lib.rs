@@ -1,3 +1,4 @@
+pub mod attachments;
 pub mod audio;
 pub mod crypto;
 pub mod history;
@@ -5,7 +6,9 @@ pub mod internet;
 mod lan;
 pub mod relay;
 pub mod session;
+pub mod sounds;
 pub mod storage;
 pub mod transport;
+pub mod updater;
 pub mod wire;
 pub mod worker;

@@ -18,9 +18,23 @@ use std::{
 
 #[derive(Serialize, Deserialize)]
 pub enum Payload {
+    Heartbeat {
+        nonce: u64,
+    },
+    Probe {
+        nonce: u64,
+    },
     Profile {
         name: String,
         avatar: String,
+    },
+    Image {
+        id: uuid::Uuid,
+        channel: String,
+        #[serde(with = "crate::wire::binary")]
+        data: Vec<u8>,
+        time: u64,
+        name: String,
     },
     Chat {
         id: uuid::Uuid,
@@ -28,6 +42,12 @@ pub enum Payload {
         text: String,
         time: u64,
         name: String,
+    },
+    VoiceFrame {
+        channel: String,
+        #[serde(with = "crate::wire::binary")]
+        data: Vec<u8>,
+        sequence: u64,
     },
     Voice {
         channel: String,
@@ -65,6 +85,13 @@ pub struct Session {
     pub profile: Profile,
     pub voice_in: Vec<(Vec<u8>, String, Vec<u8>)>,
     connections: BTreeMap<u64, LeafNodeIndex>,
+    banned: std::collections::BTreeSet<Vec<u8>>,
+    last_owner: std::time::Instant,
+    last_probe: std::time::Instant,
+    nonce: u64,
+    confirmed: bool,
+    voice_sequence: u64,
+    received_voice: BTreeMap<Vec<u8>, u64>,
 }
 impl Session {
     pub fn host(store: Store, profile: Profile) -> Result<Self> {
@@ -105,6 +132,13 @@ impl Session {
             profile,
             voice_in: Vec::new(),
             connections: BTreeMap::new(),
+            banned: Default::default(),
+            last_owner: std::time::Instant::now(),
+            last_probe: std::time::Instant::now(),
+            nonce: u64::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap()),
+            confirmed: false,
+            voice_sequence: 0,
+            received_voice: BTreeMap::new(),
         };
         result.update_own_member();
         result.new_invite();
@@ -141,6 +175,13 @@ impl Session {
             profile,
             voice_in: Vec::new(),
             connections: BTreeMap::new(),
+            banned: Default::default(),
+            last_owner: std::time::Instant::now(),
+            last_probe: std::time::Instant::now(),
+            nonce: u64::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap()),
+            confirmed: false,
+            voice_sequence: 0,
+            received_voice: BTreeMap::new(),
         };
         result.update_own_member();
         Ok(result)
@@ -155,7 +196,7 @@ impl Session {
         matches!(self.link, Link::Host(_))
     }
     pub fn ready(&self) -> bool {
-        self.group.is_some()
+        self.group.is_some() && (self.hosting() || self.confirmed)
     }
     pub fn own_key(&self) -> Vec<u8> {
         self.identity.public_key()
@@ -171,6 +212,14 @@ impl Session {
             }
             .into();
         }
+    }
+    pub fn ban(&mut self, key: &[u8]) -> Result<()> {
+        ensure!(
+            self.hosting() && key != self.owner,
+            "Только владелец может заблокировать участника"
+        );
+        self.banned.insert(key.to_vec());
+        self.kick(key)
     }
     pub fn kick(&mut self, key: &[u8]) -> Result<()> {
         ensure!(self.hosting(), "Исключать участников может только владелец");
@@ -198,6 +247,7 @@ impl Session {
         self.connection().send(Packet::Commit { data })?;
         self.connections.remove(&connection);
         self.members.remove(key);
+        self.received_voice.remove(key);
         Ok(())
     }
     pub fn new_invite(&mut self) {
@@ -228,24 +278,77 @@ impl Session {
         self.send(Payload::Profile {
             name: self.profile.name.clone(),
             avatar: STANDARD.encode(&self.profile.avatar),
-        })
+        })?;
+        let member = self.members.get(&self.own_key()).cloned();
+        if let Some(member) = member {
+            self.send(Payload::VoiceState {
+                channel: member.voice,
+                muted: member.muted,
+            })?;
+        }
+        Ok(())
     }
     pub fn send(&mut self, payload: Payload) -> Result<()> {
+        let payload = match payload {
+            Payload::Voice { channel, data } => {
+                self.voice_sequence += 1;
+                Payload::VoiceFrame {
+                    channel,
+                    data,
+                    sequence: self.voice_sequence,
+                }
+            }
+            p => p,
+        };
         let group = self.group.as_mut().context("Группа ещё не готова")?;
         let data = self
             .identity
             .encrypt(group, &serde_json::to_vec(&payload)?)?;
         // Persist the sending ratchet before ciphertext becomes visible to the network.
-        if !matches!(payload, Payload::Voice { .. }) {
+        if !matches!(
+            payload,
+            Payload::VoiceFrame { .. } | Payload::Heartbeat { .. } | Payload::Probe { .. }
+        ) {
             self.identity.save(&self.store)?;
         }
-        self.connection().send(Packet::Content { data })?;
+        self.connection()
+            .send(if matches!(payload, Payload::VoiceFrame { .. }) {
+                Packet::Voice { data }
+            } else {
+                Packet::Content { data }
+            })?;
         if let Payload::VoiceState { channel, muted } = payload {
             if let Some(member) = self.members.get_mut(&self.identity.public_key()) {
                 member.voice = channel;
                 member.muted = muted;
             }
         }
+        Ok(())
+    }
+    pub fn image(&mut self, channel: &str, path: &std::path::Path) -> Result<()> {
+        let data = crate::attachments::prepare(path)?;
+        let id = uuid::Uuid::new_v4();
+        let time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+        crate::attachments::save(&self.store, id, &data)?;
+        self.send(Payload::Image {
+            id,
+            channel: channel.into(),
+            data,
+            time,
+            name: self.profile.name.clone(),
+        })?;
+        self.history.append(
+            &self.store,
+            Message {
+                id,
+                channel: channel.into(),
+                author_key: self.own_key(),
+                display_name: self.profile.name.clone(),
+                text: "Изображение".into(),
+                timestamp_ms: time,
+                image: Some(id),
+            },
+        )?;
         Ok(())
     }
     pub fn chat(&mut self, channel: &str, text: &str) -> Result<()> {
@@ -270,12 +373,23 @@ impl Session {
                 display_name: self.profile.name.clone(),
                 text: text.into(),
                 timestamp_ms: time,
+                image: None,
                 channel: channel.into(),
             },
         )?;
         Ok(())
     }
     pub fn poll(&mut self) -> Result<()> {
+        if !self.hosting() {
+            ensure!(
+                self.last_owner.elapsed().as_secs() < 15,
+                "Сервер больше не отвечает. Сессия закрыта"
+            );
+            if self.group.is_some() && self.last_probe.elapsed().as_secs() >= 3 {
+                self.send(Payload::Probe { nonce: self.nonce })?;
+                self.last_probe = std::time::Instant::now();
+            }
+        }
         if let Some(rx) = &self.invite {
             if let Ok(event) = rx.try_recv() {
                 match event {
@@ -299,7 +413,13 @@ impl Session {
                     connection,
                     package,
                 } if self.hosting() => {
-                    if self.closed {
+                    let key = self.identity.package_key(&package);
+                    if self.closed
+                        || key.as_ref().is_err()
+                        || key
+                            .as_ref()
+                            .is_ok_and(|k| self.banned.contains(k) || self.members.contains_key(k))
+                    {
                         self.connection().send(Packet::Disconnect { connection })?;
                         continue;
                     }
@@ -337,7 +457,8 @@ impl Session {
                     );
                     self.group = Some(group);
                     self.identity.save(&self.store)?;
-                    self.status = "Подключено · сквозное шифрование MLS".into();
+                    self.status = "Проверяем доступность владельца…".into();
+                    self.send(Payload::Probe { nonce: self.nonce })?;
                     self.send_profile()?;
                 }
                 Packet::Commit { data } if !self.hosting() => {
@@ -346,10 +467,11 @@ impl Session {
                         .receive_owner_commit(group, &data, &self.owner)?;
                     let keys: Vec<_> = group.members().map(|m| m.signature_key).collect();
                     self.members.retain(|key, _| keys.contains(key));
+                    self.received_voice.retain(|key, _| keys.contains(key));
                     self.identity.save(&self.store)?;
                     self.send_profile()?;
                 }
-                Packet::Content { data } => {
+                Packet::Content { data } | Packet::Voice { data } => {
                     let group = self.group.as_mut().context("Нет группы")?;
                     let (author, bytes) = match self.identity.receive_content(group, &data) {
                         Ok(value) => value,
@@ -365,10 +487,56 @@ impl Session {
                             continue;
                         }
                     };
-                    if !matches!(payload, Payload::Voice { .. }) {
+                    if !matches!(
+                        payload,
+                        Payload::VoiceFrame { .. }
+                            | Payload::Heartbeat { .. }
+                            | Payload::Probe { .. }
+                    ) {
                         self.identity.save(&self.store)?;
                     }
                     match payload {
+                        Payload::Probe { nonce } => {
+                            if self.hosting() {
+                                self.send(Payload::Heartbeat { nonce })?;
+                            }
+                        }
+                        Payload::Heartbeat { nonce } => {
+                            if author == self.owner && nonce == self.nonce {
+                                self.last_owner = std::time::Instant::now();
+                                self.confirmed = true;
+                                self.status = "Подключено · сквозное шифрование MLS".into();
+                            }
+                        }
+                        Payload::Image {
+                            id,
+                            channel,
+                            data,
+                            time,
+                            name,
+                        } => {
+                            if !valid_channel(&channel)
+                                || name.chars().count() > 40
+                                || name.chars().any(char::is_control)
+                            {
+                                continue;
+                            }
+                            if crate::attachments::save(&self.store, id, &data).is_err() {
+                                continue;
+                            }
+                            self.history.append(
+                                &self.store,
+                                Message {
+                                    id,
+                                    author_key: author,
+                                    display_name: name,
+                                    channel,
+                                    text: "Изображение".into(),
+                                    timestamp_ms: time,
+                                    image: Some(id),
+                                },
+                            )?;
+                        }
                         Payload::Profile { name, avatar } => {
                             if name.trim().is_empty()
                                 || name.chars().count() > 40
@@ -412,14 +580,28 @@ impl Session {
                                     display_name: name,
                                     text,
                                     timestamp_ms: time,
+                                    image: None,
                                     channel,
                                 },
                             )?;
                         }
-                        Payload::Voice { channel, data } => {
+                        Payload::Voice { .. } => {}
+                        Payload::VoiceFrame {
+                            channel,
+                            data,
+                            sequence,
+                        } => {
                             if data.len() > 4000 || !valid_channel(&channel) {
                                 continue;
                             }
+                            if self
+                                .received_voice
+                                .get(&author)
+                                .is_some_and(|last| sequence <= *last)
+                            {
+                                continue;
+                            }
+                            self.received_voice.insert(author.clone(), sequence);
                             if self.voice_in.len() < 64 {
                                 self.voice_in.push((author, channel, data));
                             }
@@ -440,6 +622,7 @@ impl Session {
                         let group = self.group.as_mut().context("Нет группы")?;
                         if let Some(member) = group.member_at(index) {
                             self.members.remove(&member.signature_key);
+                            self.received_voice.remove(&member.signature_key);
                         }
                         let (commit, _, _) = group.remove_members(
                             &self.identity.provider,
@@ -486,6 +669,90 @@ mod tests {
                 Instant::now() < until,
                 "Состояния участников не синхронизировались"
             );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    #[test]
+    fn ban_rejects_same_identity_and_owner_exit_never_confirms_pending_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile {
+            name: "Друг".into(),
+            ..Default::default()
+        };
+        let root = dir.path().join("guest");
+        let mut host = Session::host_with(
+            Store::open(dir.path().join("host")).unwrap(),
+            Profile {
+                name: "Хозяин".into(),
+                ..Default::default()
+            },
+            InternetHost::local,
+        )
+        .unwrap();
+        let make_guest = |h: &Session| {
+            let Link::Host(network) = &h.link else {
+                unreachable!()
+            };
+            Session::from_guest(
+                Store::open(root.clone()).unwrap(),
+                profile.clone(),
+                network.local_guest().unwrap(),
+            )
+            .unwrap()
+        };
+        let mut guests = vec![make_guest(&host)];
+        pump(&mut host, &mut guests, |h, gs| {
+            h.members.len() == 2 && gs[0].ready()
+        });
+        let image_path = dir.path().join("image.png");
+        image::RgbImage::from_pixel(16, 16, image::Rgb([12, 40, 90]))
+            .save(&image_path)
+            .unwrap();
+        guests[0].image("Общий", &image_path).unwrap();
+        pump(&mut host, &mut guests, |h, _| h.history.messages.len() == 1);
+        let image_id = host.history.messages[0].image.unwrap();
+        assert!(
+            host.store
+                .load::<Vec<u8>>(&format!("image-{image_id}"))
+                .unwrap()
+                .is_some()
+        );
+        host.ban(&guests[0].own_key()).unwrap();
+        guests.clear();
+        let mut rejected = make_guest(&host);
+        let until = Instant::now() + Duration::from_secs(3);
+        loop {
+            host.poll().unwrap();
+            if rejected.poll().is_err() {
+                break;
+            }
+            assert!(!rejected.ready());
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(host.members.len(), 1);
+        drop(rejected);
+        // New session clears the ban, but ending it while the new guest is pending must not admit a ghost owner.
+        drop(host);
+        let host = Session::host_with(
+            Store::open(dir.path().join("host")).unwrap(),
+            Profile {
+                name: "Хозяин".into(),
+                ..Default::default()
+            },
+            InternetHost::local,
+        )
+        .unwrap();
+        let mut pending = make_guest(&host);
+        assert!(!pending.ready());
+        drop(host);
+        let until = Instant::now() + Duration::from_secs(3);
+        loop {
+            if pending.poll().is_err() {
+                break;
+            }
+            assert!(!pending.ready());
+            assert!(Instant::now() < until);
             std::thread::sleep(Duration::from_millis(10));
         }
     }

@@ -33,7 +33,12 @@ enum Request {
     },
     Payload(Payload),
     Profile(Profile),
+    Image {
+        channel: String,
+        path: std::path::PathBuf,
+    },
     Kick(Vec<u8>),
+    Ban(Vec<u8>),
     Closed(bool),
 }
 #[derive(Serialize, Deserialize)]
@@ -185,17 +190,21 @@ impl SessionProxy {
             profile,
             code: code.into(),
         })?;
-        let deadline = Instant::now() + Duration::from_secs(175);
-        let event = loop {
+        let deadline = Instant::now() + Duration::from_secs(75);
+        loop {
             ensure!(!cancel.load(Ordering::Relaxed), "Подключение отменено");
             ensure!(Instant::now() < deadline, "Рабочий процесс не ответил");
             match result.events.recv_timeout(Duration::from_millis(100)) {
-                Ok(event) => break event?,
+                Ok(event) => {
+                    result.apply(event?)?;
+                    if result.ready {
+                        break;
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => anyhow::bail!("Рабочий процесс завершён"),
             }
-        };
-        result.apply(event)?;
+        }
         Ok(result)
     }
     fn request(&self, request: Request) -> Result<()> {
@@ -253,6 +262,15 @@ impl SessionProxy {
         if let Err(e) = self.request(Request::Closed(value)) {
             self.status = e.to_string();
         }
+    }
+    pub fn ban(&mut self, key: &[u8]) -> Result<()> {
+        self.request(Request::Ban(key.into()))
+    }
+    pub fn image(&mut self, channel: &str, path: std::path::PathBuf) -> Result<()> {
+        self.request(Request::Image {
+            channel: channel.into(),
+            path,
+        })
     }
     pub fn kick(&mut self, key: &[u8]) -> Result<()> {
         self.request(Request::Kick(key.into()))
@@ -362,7 +380,9 @@ pub fn run() -> Result<()> {
                 Request::Chat { channel, text } => session.chat(&channel, &text),
                 Request::Payload(payload) => session.send(payload),
                 Request::Profile(profile) => session.update_profile(profile),
+                Request::Image { channel, path } => session.image(&channel, &path),
                 Request::Kick(key) => session.kick(&key),
+                Request::Ban(key) => session.ban(&key),
                 Request::Closed(value) => {
                     session.set_closed(value);
                     Ok(())

@@ -30,7 +30,6 @@ struct App {
     muted: bool,
     deafened: bool,
     ptt: bool,
-    choosing_ptt_key: bool,
     input_device: String,
     output_device: String,
     inputs: Vec<String>,
@@ -41,6 +40,15 @@ struct App {
     brand: egui::TextureHandle,
     copied_until: Option<std::time::Instant>,
     show_members: bool,
+    settings_tab: usize,
+    choosing_key: Option<usize>,
+    user_card: Option<Vec<u8>>,
+    speaking: std::collections::BTreeMap<Vec<u8>, std::time::Instant>,
+    image_textures: std::collections::BTreeMap<uuid::Uuid, egui::TextureHandle>,
+    update_rx: Option<mpsc::Receiver<anyhow::Result<Option<thodtalk::updater::Prepared>>>>,
+    update_ready: Option<thodtalk::updater::Prepared>,
+    update_status: String,
+    update_started: bool,
     _lock: std::fs::File,
 }
 impl App {
@@ -75,7 +83,6 @@ impl App {
             muted: false,
             deafened: false,
             ptt: false,
-            choosing_ptt_key: false,
             input_device: String::new(),
             output_device: String::new(),
             inputs,
@@ -91,6 +98,15 @@ impl App {
             .unwrap(),
             copied_until: None,
             show_members: false,
+            settings_tab: 0,
+            choosing_key: None,
+            user_card: None,
+            speaking: Default::default(),
+            image_textures: Default::default(),
+            update_rx: None,
+            update_ready: None,
+            update_status: String::new(),
+            update_started: false,
             _lock: lock,
         };
         app.input_device = app.profile.input_device.clone();
@@ -123,7 +139,15 @@ impl App {
             let _ = tx.send(result);
         });
     }
+    fn sound(&self, sound: thodtalk::sounds::Sound) {
+        if self.profile.sounds && !self.deafened {
+            thodtalk::sounds::play(sound);
+        }
+    }
     fn stop_voice(&mut self) {
+        if self.voice_channel.is_some() {
+            self.sound(thodtalk::sounds::Sound::Leave);
+        }
         self.audio.take();
         self.voice_channel = None;
         if let Some(session) = &mut self.session {
@@ -140,6 +164,7 @@ impl App {
         }
         match Audio::start(&self.input_device, &self.output_device) {
             Ok(audio) => {
+                self.sound(thodtalk::sounds::Sound::Join);
                 self.audio = Some(audio);
                 self.voice_channel = Some(self.channel.clone());
                 if let Some(session) = &mut self.session {
@@ -153,6 +178,53 @@ impl App {
         }
     }
     fn tick(&mut self, ctx: &egui::Context) {
+        if self.saved && self.profile.auto_update && !self.update_started {
+            self.check_updates();
+        }
+        if let Some(rx) = &self.update_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.update_rx = None;
+                match result {
+                    Ok(Some(prepared)) => {
+                        self.update_status = format!(
+                            "Версия {} загружена. Перезапуск после завершения разговора.",
+                            prepared.version
+                        );
+                        self.update_ready = Some(prepared);
+                    }
+                    Ok(None) => {
+                        self.update_status = "Установлена последняя опубликованная версия".into()
+                    }
+                    Err(e) => self.update_status = format!("Не удалось проверить обновление: {e}"),
+                }
+            }
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if self.profile.auto_update
+            && self.update_ready.is_some()
+            && self.session.is_none()
+            && self.connecting.is_none()
+            && !self.editing
+            && self.draft.is_empty()
+        {
+            self.install_update(ctx);
+        }
+        if self.choosing_key.is_none() && !ctx.wants_keyboard_input() {
+            let mute = egui::Key::from_name(&self.profile.mute_key)
+                .is_some_and(|k| ctx.input(|i| i.key_pressed(k)));
+            let deafen = egui::Key::from_name(&self.profile.deafen_key)
+                .is_some_and(|k| ctx.input(|i| i.key_pressed(k)));
+            if mute {
+                self.muted = !self.muted;
+            }
+            if deafen {
+                self.deafened = !self.deafened;
+            }
+            if mute || deafen {
+                self.voice_state();
+            }
+        }
+
         if let Some(rx) = &self.connecting {
             if let Ok(result) = rx.try_recv() {
                 self.connecting = None;
@@ -167,16 +239,53 @@ impl App {
         }
         let mut disconnected = false;
         if let Some(session) = &mut self.session {
+            let old_message = session.history.messages.last().map(|m| m.id);
+            let old_voices: std::collections::BTreeMap<_, _> = session
+                .members
+                .iter()
+                .map(|(k, m)| (k.clone(), m.voice.clone()))
+                .collect();
             if let Err(e) = session.poll() {
                 self.error = format!("Соединение прервано: {e}. История сохранена локально.");
                 disconnected = true;
             }
+            if self.profile.sounds && !self.deafened {
+                if session
+                    .history
+                    .messages
+                    .last()
+                    .is_some_and(|m| Some(m.id) != old_message && m.author_key != session.own_key())
+                {
+                    thodtalk::sounds::play(thodtalk::sounds::Sound::Received);
+                }
+                if self.voice_channel.is_some() {
+                    let joined = session.members.iter().any(|(k, m)| {
+                        k != &session.own_key()
+                            && m.voice == self.voice_channel
+                            && old_voices.get(k) != Some(&m.voice)
+                    });
+                    let left = old_voices.iter().any(|(k, v)| {
+                        k != &session.own_key()
+                            && v == &self.voice_channel
+                            && session.members.get(k).map(|m| &m.voice) != Some(v)
+                    });
+                    if joined {
+                        thodtalk::sounds::play(thodtalk::sounds::Sound::Join);
+                    } else if left {
+                        thodtalk::sounds::play(thodtalk::sounds::Sound::Leave);
+                    }
+                }
+            }
             if let Some(audio) = &mut self.audio {
                 let key = egui::Key::from_name(&self.profile.ptt_key).unwrap_or(egui::Key::F8);
-                let held = !self.choosing_ptt_key && ctx.input(|i| i.key_down(key));
+                let held = self.choosing_key.is_none() && ctx.input(|i| i.key_down(key));
                 let enabled = !self.muted && !self.deafened && (!self.ptt || held);
                 audio.transmitting.store(enabled, Ordering::Relaxed);
                 audio.deafened.store(self.deafened, Ordering::Relaxed);
+                if enabled && f32::from_bits(audio.level.load(Ordering::Relaxed)) > 0.015 {
+                    self.speaking
+                        .insert(session.own_key(), std::time::Instant::now());
+                }
                 if let Ok(error) = audio.errors.try_recv() {
                     self.error = error;
                 }
@@ -197,8 +306,18 @@ impl App {
                 }
                 for (author, channel, data) in session.voice_in.drain(..) {
                     if self.voice_channel.as_ref() == Some(&channel) {
-                        if let Err(e) = audio.play(author, &data) {
-                            self.error = format!("Голосовой пакет: {e}");
+                        let gain = self
+                            .profile
+                            .volumes
+                            .get(&key_string(&author))
+                            .copied()
+                            .unwrap_or(1.0);
+                        match audio.play(author.clone(), &data, gain) {
+                            Ok(true) => {
+                                self.speaking.insert(author, std::time::Instant::now());
+                            }
+                            Ok(false) => {}
+                            Err(e) => self.error = format!("Голосовой пакет: {e}"),
                         }
                     }
                 }
@@ -216,123 +335,223 @@ impl App {
         }
     }
     fn profile_ui(&mut self, ui: &mut egui::Ui) {
-        ui.set_max_width(600.0);
-        ui.heading(if self.saved {
-            "Мой профиль"
-        } else {
-            "Ваш профиль"
-        });
-        ui.label(
-            egui::RichText::new("Имя и фотография, которые увидят ваши друзья.")
-                .color(ui::muted(self.profile.light_theme)),
-        );
-        ui.add_space(20.0);
-        let mut choose = false;
-        ui.horizontal(|ui| {
-            ui::avatar(ui, self.avatar.as_ref(), &self.profile.name, 80.0);
-            ui.add_space(12.0);
+        ui.heading("Настройки");
+        ui.add_space(12.0);
+        ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
-                ui.label(ui::heading("Фотография профиля", 16.0));
-                choose = ui.button("Выбрать изображение").clicked();
-                ui.small("JPG, PNG, WebP · до 20 МБ");
+                ui.set_width(128.0);
+                for (index, name) in ["Профиль", "Основное", "Звук", "Клавиши", "Обновления"]
+                    .iter()
+                    .enumerate()
+                {
+                    ui.selectable_value(&mut self.settings_tab, index, *name);
+                }
+            });
+            ui.add_space(16.0);
+            ui.vertical(|ui| {
+                ui.set_max_width(500.0);
+                match self.settings_tab {
+                    0 => {
+                        let mut choose = false;
+                        ui.horizontal(|ui| {
+                            ui::avatar(ui, self.avatar.as_ref(), &self.profile.name, 80.0);
+                            ui.add_space(12.0);
+                            ui.vertical(|ui| {
+                                ui.label(ui::heading("Фотография профиля", 16.0));
+                                choose = ui.button("Выбрать изображение").clicked();
+                                ui.small("JPG, PNG, WebP · до 20 МБ");
+                            });
+                        });
+                        if choose {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter(
+                                    "Изображения",
+                                    &["png", "jpg", "jpeg", "webp", "gif", "bmp"],
+                                )
+                                .pick_file()
+                            {
+                                match avatar_from_file(&path) {
+                                    Ok(bytes) => {
+                                        self.profile.avatar = bytes;
+                                        self.update_avatar(ui.ctx());
+                                    }
+                                    Err(e) => self.error = e.to_string(),
+                                }
+                            }
+                        }
+                        ui.add_space(12.0);
+                        ui.label("Отображаемое имя");
+                        ui.add_sized(
+                            [ui.available_width(), 32.0],
+                            egui::TextEdit::singleline(&mut self.profile.name)
+                                .hint_text(ui::hint(
+                                    "Как к вам обращаться",
+                                    !ui.visuals().dark_mode,
+                                ))
+                                .char_limit(40)
+                                .margin(egui::vec2(10.0, 8.0)),
+                        );
+                    }
+                    1 => {
+                        if ui
+                            .checkbox(&mut self.profile.light_theme, "Светлая тема")
+                            .changed()
+                        {
+                            ui::theme(ui.ctx(), self.profile.light_theme);
+                        }
+                        ui.checkbox(
+                            &mut self.profile.sounds,
+                            "Звуки сообщений и голосового чата",
+                        );
+                        ui.weak("Профиль и переписки хранятся на этом компьютере.");
+                    }
+                    2 => {
+                        egui::ComboBox::from_label("Микрофон")
+                            .selected_text(if self.input_device.is_empty() {
+                                "По умолчанию"
+                            } else {
+                                &self.input_device
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.input_device,
+                                    String::new(),
+                                    "По умолчанию",
+                                );
+                                for name in &self.inputs {
+                                    ui.selectable_value(&mut self.input_device, name.clone(), name);
+                                }
+                            });
+                        egui::ComboBox::from_label("Наушники / динамики")
+                            .selected_text(if self.output_device.is_empty() {
+                                "По умолчанию"
+                            } else {
+                                &self.output_device
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.output_device,
+                                    String::new(),
+                                    "По умолчанию",
+                                );
+                                for name in &self.outputs {
+                                    ui.selectable_value(
+                                        &mut self.output_device,
+                                        name.clone(),
+                                        name,
+                                    );
+                                }
+                            });
+
+                        ui.checkbox(&mut self.ptt, "Говорить при удержании клавиши");
+                        ui.weak("Изменения устройств применяются при следующем входе в голос.");
+                    }
+                    3 => {
+                        ui.weak("Клавиши действуют в активном окне. Esc — отменить назначение.");
+                        for (index, label) in [
+                            "Разговор по нажатию",
+                            "Микрофон: вкл. / выкл.",
+                            "Звук: вкл. / выкл.",
+                        ]
+                        .iter()
+                        .enumerate()
+                        {
+                            let value = match index {
+                                0 => &self.profile.ptt_key,
+                                1 => &self.profile.mute_key,
+                                _ => &self.profile.deafen_key,
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(*label);
+                                if ui
+                                    .button(if self.choosing_key == Some(index) {
+                                        "Нажмите клавишу…"
+                                    } else {
+                                        value
+                                    })
+                                    .clicked()
+                                {
+                                    self.choosing_key = Some(index);
+                                }
+                            });
+                        }
+                        ui.separator();
+                        ui.label("Enter — отправить сообщение");
+                        ui.label("Shift+Enter — новая строка");
+                        ui.label("Tab / Shift+Tab — переход между элементами");
+                        if let Some(index) = self.choosing_key {
+                            let pressed = ui.input(|i| {
+                                i.events.iter().find_map(|e| match e {
+                                    egui::Event::Key {
+                                        key,
+                                        physical_key,
+                                        pressed: true,
+                                        repeat: false,
+                                        ..
+                                    } => Some(physical_key.unwrap_or(*key)),
+                                    _ => None,
+                                })
+                            });
+                            if let Some(key) = pressed {
+                                if key != egui::Key::Escape {
+                                    let name = key.name().to_string();
+                                    let others = [
+                                        &self.profile.ptt_key,
+                                        &self.profile.mute_key,
+                                        &self.profile.deafen_key,
+                                    ];
+                                    if [egui::Key::Enter, egui::Key::Tab].contains(&key)
+                                        || others
+                                            .iter()
+                                            .enumerate()
+                                            .any(|(i, k)| i != index && **k == name)
+                                    {
+                                        self.error = "Эта клавиша уже занята".into();
+                                    } else {
+                                        match index {
+                                            0 => self.profile.ptt_key = name,
+                                            1 => self.profile.mute_key = name,
+                                            _ => self.profile.deafen_key = name,
+                                        };
+                                    }
+                                }
+                                self.choosing_key = None;
+                            }
+                        }
+                    }
+                    _ => {
+                        ui.label(format!("Установлена версия {}", env!("CARGO_PKG_VERSION")));
+                        ui.checkbox(
+                            &mut self.profile.auto_update,
+                            "Загружать и устанавливать обновления автоматически",
+                        );
+                        ui.weak("Обновление применяется вне разговора, с перезапуском приложения.");
+                        if ui
+                            .add_enabled(
+                                self.update_rx.is_none(),
+                                egui::Button::new("Проверить обновления"),
+                            )
+                            .clicked()
+                        {
+                            self.check_updates();
+                        }
+                        ui.label(&self.update_status);
+                        if self.update_ready.is_some()
+                            && ui
+                                .add_enabled(
+                                    self.session.is_none() && self.connecting.is_none(),
+                                    egui::Button::new("Установить и перезапустить"),
+                                )
+                                .clicked()
+                        {
+                            self.install_update(ui.ctx());
+                        }
+                    }
+                }
             });
         });
-        if choose {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Изображения", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
-                .pick_file()
-            {
-                match avatar_from_file(&path) {
-                    Ok(bytes) => {
-                        self.profile.avatar = bytes;
-                        self.update_avatar(ui.ctx());
-                    }
-                    Err(e) => self.error = e.to_string(),
-                }
-            }
-        }
-        ui.add_space(12.0);
-        ui.label("Отображаемое имя");
-        ui.add_sized(
-            [ui.available_width(), 44.0],
-            egui::TextEdit::singleline(&mut self.profile.name)
-                .hint_text(ui::hint("Как к вам обращаться", !ui.visuals().dark_mode))
-                .char_limit(40)
-                .margin(egui::vec2(12.0, 12.0)),
-        );
-        ui.add_space(20.0);
-        ui.separator();
-        ui.add_space(12.0);
-        ui.label(ui::heading("Подключение и звук", 18.0));
-        ui.small("Микрофон включается только после входа в голос.");
-        egui::ComboBox::from_label("Микрофон")
-            .selected_text(if self.input_device.is_empty() {
-                "По умолчанию"
-            } else {
-                &self.input_device
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.input_device, String::new(), "По умолчанию");
-                for name in &self.inputs {
-                    ui.selectable_value(&mut self.input_device, name.clone(), name);
-                }
-            });
-        egui::ComboBox::from_label("Наушники / динамики")
-            .selected_text(if self.output_device.is_empty() {
-                "По умолчанию"
-            } else {
-                &self.output_device
-            })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.output_device, String::new(), "По умолчанию");
-                for name in &self.outputs {
-                    ui.selectable_value(&mut self.output_device, name.clone(), name);
-                }
-            });
-        ui.checkbox(&mut self.ptt, "Говорить при удержании клавиши");
-        if self.ptt {
-            ui.horizontal(|ui| {
-                ui.label("Клавиша:");
-                if ui
-                    .button(if self.choosing_ptt_key {
-                        "Нажмите клавишу…"
-                    } else {
-                        &self.profile.ptt_key
-                    })
-                    .clicked()
-                {
-                    self.choosing_ptt_key = true;
-                }
-                ui.small("В активном окне · Esc — отмена");
-            });
-            if self.choosing_ptt_key {
-                let key = ui.input(|i| {
-                    i.events.iter().find_map(|event| match event {
-                        egui::Event::Key {
-                            key,
-                            physical_key,
-                            pressed: true,
-                            repeat: false,
-                            ..
-                        } => Some(physical_key.unwrap_or(*key)),
-                        _ => None,
-                    })
-                });
-                if let Some(key) = key {
-                    if key != egui::Key::Escape {
-                        self.profile.ptt_key = key.name().into();
-                    }
-                    self.choosing_ptt_key = false;
-                }
-            }
-        }
-        if ui
-            .checkbox(&mut self.profile.light_theme, "Светлая тема")
-            .changed()
-        {
-            ui::theme(ui.ctx(), self.profile.light_theme);
-        }
         ui.add_space(16.0);
+        ui.hyperlink_to("GitHub · ThodProd", "https://github.com/ThodProd");
         if ui
             .add_enabled(!self.storage_error, ui::primary("Сохранить профиль"))
             .clicked()
@@ -366,6 +585,7 @@ impl App {
             }
         }
     }
+
     fn home_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Ваши разговоры");
         ui.label(
@@ -413,7 +633,7 @@ impl App {
         host |= ui
             .add_enabled(
                 enabled,
-                egui::Button::new("Запустить сервер").min_size(egui::vec2(0.0, 44.0)),
+                egui::Button::new("Запустить сервер").min_size(egui::vec2(0.0, 30.0)),
             )
             .clicked();
         ui.small("Сервер доступен, пока приложение открыто.");
@@ -426,7 +646,7 @@ impl App {
         if self.connecting.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Подключаемся… В сложной сети это может занять до 3 минут.");
+                ui.label("Подключаемся… В сложной сети это может занять до минуты.");
             });
         }
         if self.connecting.is_some() && ui.button("Отменить подключение").clicked()
@@ -490,6 +710,32 @@ impl App {
                                     message.display_name, message.channel
                                 ));
                                 ui.label(&message.text);
+                                if let Some(id) = message.image {
+                                    if !self.image_textures.contains_key(&id) {
+                                        if self.image_textures.len() >= 32 {
+                                            self.image_textures.clear();
+                                        }
+                                        if let Ok(Some(bytes)) =
+                                            self.store.load::<Vec<u8>>(&format!("image-{id}"))
+                                        {
+                                            if let Some(img) =
+                                                texture(ui.ctx(), &format!("image-{id}"), &bytes)
+                                            {
+                                                self.image_textures.insert(id, img);
+                                            }
+                                        }
+                                    }
+                                    if let Some(img) = self.image_textures.get(&id) {
+                                        ui.add(
+                                            egui::Image::new(img)
+                                                .max_size(egui::vec2(
+                                                    ui.available_width().min(400.0),
+                                                    280.0,
+                                                ))
+                                                .corner_radius(8),
+                                        );
+                                    }
+                                }
                             }
                         });
                     }
@@ -498,9 +744,8 @@ impl App {
     }
     fn chat_ui(&mut self, ui: &mut egui::Ui) {
         let light = self.profile.light_theme;
-        let mut enter_voice = false;
-        let mut leave_voice = false;
         let mut send = false;
+        let mut attach = false;
         let session = self.session.as_mut().unwrap();
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("#").size(28.0).color(ui::muted(light)));
@@ -556,7 +801,7 @@ impl App {
         ui.add_space(4.0);
         ui.separator();
         ui.add_space(4.0);
-        let height = (ui.available_height() - 164.0).max(80.0);
+        let height = (ui.available_height() - 100.0).max(80.0);
         egui::ScrollArea::vertical()
             .id_salt(("messages", &self.channel))
             .stick_to_bottom(true)
@@ -618,47 +863,59 @@ impl App {
                                     .color(ui::muted(light)),
                                 );
                             });
-                            ui.add(egui::Label::new(&message.text).wrap());
+                            if let Some(id) = message.image {
+                                if !self.image_textures.contains_key(&id) {
+                                    if self.image_textures.len() >= 32 {
+                                        self.image_textures.clear();
+                                    }
+                                    if let Ok(Some(bytes)) =
+                                        self.store.load::<Vec<u8>>(&format!("image-{id}"))
+                                    {
+                                        if let Some(img) =
+                                            texture(ui.ctx(), &format!("image-{id}"), &bytes)
+                                        {
+                                            self.image_textures.insert(id, img);
+                                        }
+                                    }
+                                }
+                                if let Some(img) = self.image_textures.get(&id) {
+                                    ui.add(
+                                        egui::Image::new(img)
+                                            .max_size(egui::vec2(
+                                                ui.available_width().min(400.0),
+                                                280.0,
+                                            ))
+                                            .corner_radius(8),
+                                    );
+                                }
+                            } else {
+                                ui.add(egui::Label::new(&message.text).wrap());
+                            }
                         });
                     });
                     ui.add_space(8.0);
                 }
             });
         ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            if let Some(channel) = &self.voice_channel {
-                ui::badge(ui, &format!("Голос · {channel}"), light);
-                let changed = ui.checkbox(&mut self.muted, "Без микрофона").changed()
-                    | ui.checkbox(&mut self.deafened, "Без звука").changed();
-                if changed {
-                    let _ = session.send(Payload::VoiceState {
-                        channel: self.voice_channel.clone(),
-                        muted: self.muted || self.deafened,
-                    });
-                }
-                leave_voice = ui.button("Выйти").clicked();
-            } else {
-                enter_voice = ui
-                    .add_enabled(session.ready(), egui::Button::new("Войти в голос"))
-                    .clicked();
-                ui.label(
-                    egui::RichText::new("Микрофон выключен")
-                        .size(12.0)
-                        .color(ui::muted(light)),
-                );
-            }
-        });
-        let shortcut = ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
+        let composer_id = ui.id().with("composer");
+        let shortcut = ui.memory(|m| m.has_focus(composer_id))
+            && ui.input(|i| !i.modifiers.shift && !i.modifiers.alt)
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         egui::Frame::new()
             .fill(ui::surface(light))
             .corner_radius(12)
             .inner_margin(12)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let width = (ui.available_width() - 120.0).max(80.0);
+                    attach = ui
+                        .add_enabled(session.ready(), egui::Button::new("＋"))
+                        .on_hover_text("Прикрепить изображение")
+                        .clicked();
+                    let width = (ui.available_width() - 150.0).max(80.0);
                     let response = ui.add_sized(
                         [width, 50.0],
                         egui::TextEdit::multiline(&mut self.draft)
+                            .id(composer_id)
                             .frame(false)
                             .hint_text(ui::hint(format!("Написать в #{}", self.channel), light))
                             .char_limit(16000),
@@ -669,25 +926,32 @@ impl App {
                             ui::primary("Отправить"),
                         )
                         .clicked()
-                        || (response.has_focus() && shortcut);
+                        || ((response.has_focus() || response.lost_focus()) && shortcut);
                 });
             });
         ui.label(
-            egui::RichText::new("Ctrl+Enter — отправить · Enter — новая строка")
+            egui::RichText::new("Enter — отправить · Shift+Enter — новая строка")
                 .size(11.0)
                 .color(ui::muted(light)),
         );
-        if send {
-            match session.chat(&self.channel, &self.draft) {
-                Ok(()) => self.draft.clear(),
-                Err(e) => self.error = e.to_string(),
+        if attach {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Изображения", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
+                .pick_file()
+            {
+                if let Err(e) = session.image(&self.channel, path) {
+                    self.error = e.to_string();
+                }
             }
         }
-        if leave_voice {
-            self.stop_voice();
-        }
-        if enter_voice {
-            self.start_voice();
+        if send && session.ready() && !self.draft.trim().is_empty() {
+            match session.chat(&self.channel, &self.draft) {
+                Ok(()) => {
+                    self.draft.clear();
+                    self.sound(thodtalk::sounds::Sound::Sent);
+                }
+                Err(e) => self.error = e.to_string(),
+            }
         }
     }
 }
@@ -695,7 +959,6 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.tick(ctx);
         let mut disconnect = false;
-        let mut kick = None;
         let light = self.profile.light_theme;
         egui::SidePanel::left("sidebar")
             .exact_width(224.0)
@@ -718,7 +981,7 @@ impl eframe::App for App {
                 ui::section(ui, "ПРОСТРАНСТВО", light);
                 if ui
                     .add_sized(
-                        [ui.available_width(), 40.0],
+                        [ui.available_width(), 30.0],
                         egui::Button::new("Ваши разговоры").selected(!self.editing),
                     )
                     .clicked()
@@ -732,7 +995,7 @@ impl eframe::App for App {
                     for channel in ["Общий", "Игры", "Музыка"] {
                         if ui
                             .add_sized(
-                                [ui.available_width(), 40.0],
+                                [ui.available_width(), 30.0],
                                 egui::Button::new(format!("#   {channel}"))
                                     .selected(self.channel == channel && !self.editing),
                             )
@@ -743,6 +1006,17 @@ impl eframe::App for App {
                         }
                     }
                     ui.add_space(20.0);
+                    ui::section(ui, "ГОЛОС", light);
+                    self.voice_controls(ui);
+                    egui::ScrollArea::vertical()
+                        .id_salt("voice-members")
+                        .max_height((ui.available_height() - 175.0).max(40.0))
+                        .show(ui, |ui| {
+                            for channel in ["Общий", "Игры", "Музыка"] {
+                                self.member_rows(ui, Some(channel));
+                            }
+                        });
+                    ui.add_space(8.0);
                     ui::section(ui, "СЕССИЯ", light);
                     ui.label(
                         egui::RichText::new(if self.session.as_ref().unwrap().hosting() {
@@ -796,7 +1070,7 @@ impl eframe::App for App {
                     if self.session.is_some()
                         && ui
                             .add_sized(
-                                [ui.available_width(), 38.0],
+                                [ui.available_width(), 30.0],
                                 egui::Button::new(egui::RichText::new("Отключиться").color(
                                     if light {
                                         egui::Color32::from_rgb(160, 70, 80)
@@ -821,101 +1095,22 @@ impl eframe::App for App {
             self.session.take();
             self.member_textures.clear();
         }
-        if let Some(session) = &self.session {
-            if !self.editing && self.show_members {
-                egui::SidePanel::right("members")
-                    .exact_width(208.0)
-                    .resizable(false)
-                    .frame(egui::Frame::new().fill(ui::sidebar(light)).inner_margin(16))
-                    .show(ctx, |ui| {
-                        ui.add_space(16.0);
-                        ui.label(ui::heading(
-                            format!("Участники · {}", session.members.len()),
-                            16.0,
-                        ));
-                        ui.add_space(16.0);
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            for (key, member) in &session.members {
-                                if !member.avatar.is_empty()
-                                    && self
-                                        .member_textures
-                                        .get(key)
-                                        .is_none_or(|(bytes, _)| bytes != &member.avatar)
-                                {
-                                    if let Some(image) =
-                                        texture(ctx, &format!("member-{key:?}"), &member.avatar)
-                                    {
-                                        self.member_textures
-                                            .insert(key.clone(), (member.avatar.clone(), image));
-                                    }
-                                }
-                                ui.horizontal_top(|ui| {
-                                    ui::avatar(
-                                        ui,
-                                        self.member_textures.get(key).map(|(_, image)| image),
-                                        &member.name,
-                                        32.0,
-                                    );
-                                    ui.vertical(|ui| {
-                                        ui.add(
-                                            egui::Label::new(ui::heading(&member.name, 14.0))
-                                                .truncate(),
-                                        )
-                                        .on_hover_text(
-                                            format!(
-                                                "Ключ профиля: {}",
-                                                key.iter()
-                                                    .map(|b| format!("{b:02x}"))
-                                                    .collect::<String>()
-                                            ),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(
-                                                if let Some(channel) = &member.voice {
-                                                    format!(
-                                                        "{} · {}",
-                                                        channel,
-                                                        if member.muted {
-                                                            "без микрофона"
-                                                        } else {
-                                                            "в голосе"
-                                                        }
-                                                    )
-                                                } else {
-                                                    "В сети".into()
-                                                },
-                                            )
-                                            .size(12.0)
-                                            .color(ui::muted(light)),
-                                        );
-                                    });
-                                });
-                                if session.hosting() && key != &session.own_key() {
-                                    ui.menu_button("Управление", |ui| {
-                                        if ui.button("Кикнуть из сессии").clicked() {
-                                            kick = Some(key.clone());
-                                            ui.close_menu();
-                                        }
-                                    });
-                                }
-                                ui.add_space(12.0);
-                            }
-                        });
-                    });
-            }
+        if self.session.is_some() && !self.editing && self.show_members {
+            egui::SidePanel::right("members")
+                .exact_width(190.0)
+                .resizable(false)
+                .frame(egui::Frame::new().fill(ui::sidebar(light)).inner_margin(12))
+                .show(ctx, |ui| {
+                    ui.label(ui::heading("Участники", 16.0));
+                    egui::ScrollArea::vertical().show(ui, |ui| self.member_rows(ui, None));
+                });
         }
-        if let Some(key) = kick {
-            if let Some(session) = &mut self.session {
-                if let Err(e) = session.kick(&key) {
-                    self.error = e.to_string();
-                }
-            }
-        }
+        self.member_card(ctx);
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(ctx.style().visuals.panel_fill)
-                    .inner_margin(28),
+                    .inner_margin(20),
             )
             .show(ctx, |ui| {
                 if !self.error.is_empty() {
@@ -945,14 +1140,260 @@ impl eframe::App for App {
             });
     }
 }
+fn key_string(key: &[u8]) -> String {
+    key.iter().map(|b| format!("{b:02x}")).collect()
+}
+impl App {
+    fn check_updates(&mut self) {
+        if self.update_rx.is_some() {
+            return;
+        }
+        self.update_started = true;
+        self.update_status = "Проверяем GitHub и загружаем новую версию…".into();
+        let root = self.store.root.clone();
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(thodtalk::updater::background_prepare(&root));
+        });
+    }
+    fn install_update(&mut self, ctx: &egui::Context) {
+        if let Some(update) = self.update_ready.take() {
+            match thodtalk::updater::install(&update) {
+                Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Err(e) => self.update_status = format!("Обновление не установлено: {e}"),
+            }
+        }
+    }
+    fn voice_state(&mut self) {
+        if let Some(session) = &mut self.session {
+            if let Err(e) = session.send(Payload::VoiceState {
+                channel: self.voice_channel.clone(),
+                muted: self.muted || self.deafened,
+            }) {
+                self.error = e.to_string();
+            }
+        }
+    }
+    fn voice_controls(&mut self, ui: &mut egui::Ui) {
+        if let Some(channel) = &self.voice_channel {
+            ui.label(
+                egui::RichText::new(format!("Голос · {channel}"))
+                    .size(12.0)
+                    .color(ui::accent(self.profile.light_theme)),
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(self.muted, "Микр.")
+                    .on_hover_text(format!("Микрофон · {}", self.profile.mute_key))
+                    .clicked()
+                {
+                    self.muted = !self.muted;
+                    self.voice_state();
+                }
+                if ui
+                    .selectable_label(self.deafened, "Звук")
+                    .on_hover_text(format!(
+                        "Заглушить всё и микрофон · {}",
+                        self.profile.deafen_key
+                    ))
+                    .clicked()
+                {
+                    self.deafened = !self.deafened;
+                    self.voice_state();
+                }
+                if ui
+                    .button("Выйти")
+                    .on_hover_text("Выйти из голосового чата")
+                    .clicked()
+                {
+                    self.stop_voice();
+                }
+            });
+        } else if ui
+            .add_enabled(
+                self.session.as_ref().is_some_and(|s| s.ready()),
+                egui::Button::new(format!("Войти · {}", self.channel)),
+            )
+            .clicked()
+        {
+            self.start_voice();
+        }
+    }
+    fn member_rows(&mut self, ui: &mut egui::Ui, channel: Option<&str>) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let own = session.own_key();
+        let hosting = session.hosting();
+        let members: Vec<_> = session
+            .members
+            .iter()
+            .filter(|(_, m)| channel.is_none() || m.voice.as_deref() == channel)
+            .map(|(k, m)| (k.clone(), m.clone()))
+            .collect();
+        if members.is_empty() {
+            return;
+        }
+        if let Some(channel) = channel {
+            ui.weak(channel);
+        }
+        for (key, member) in members {
+            if !member.avatar.is_empty()
+                && self
+                    .member_textures
+                    .get(&key)
+                    .is_none_or(|(bytes, _)| bytes != &member.avatar)
+            {
+                if let Some(image) = texture(ui.ctx(), &format!("member-{key:?}"), &member.avatar) {
+                    self.member_textures
+                        .insert(key.clone(), (member.avatar.clone(), image));
+                }
+            }
+            let speaking = !member.muted
+                && self
+                    .speaking
+                    .get(&key)
+                    .is_some_and(|time| time.elapsed() < Duration::from_millis(220));
+            let row = ui.horizontal(|ui| {
+                ui::avatar(
+                    ui,
+                    self.member_textures.get(&key).map(|(_, t)| t),
+                    &member.name,
+                    24.0,
+                );
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&member.name).size(13.0).color(
+                        if speaking {
+                            egui::Color32::from_rgb(103, 210, 155)
+                        } else {
+                            ui.visuals().text_color()
+                        },
+                    ))
+                    .truncate(),
+                );
+                if member.muted {
+                    ui.weak("×");
+                }
+                if speaking {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 16.0), egui::Sense::hover());
+                    let t = ui.input(|i| i.time) as f32;
+                    for bar in 0..3 {
+                        let h = 3.0 + ((t * 9.0 + bar as f32 * 1.7).sin().abs() * 10.0);
+                        let x = rect.left() + 3.0 + bar as f32 * 5.0;
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(x, rect.center().y - h / 2.0),
+                                egui::pos2(x, rect.center().y + h / 2.0),
+                            ],
+                            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(103, 210, 155)),
+                        );
+                    }
+                }
+            });
+            let response = ui.interact(
+                row.response.rect,
+                ui.id().with((&key, channel)),
+                egui::Sense::click(),
+            );
+            if response.clicked() {
+                self.user_card = Some(key.clone());
+            }
+            response.context_menu(|ui| {
+                if key != own {
+                    let volume_key = key_string(&key);
+                    let volume = self.profile.volumes.entry(volume_key).or_insert(1.0);
+                    if ui
+                        .button(if *volume == 0.0 {
+                            "Включить звук участника"
+                        } else {
+                            "Заглушить для себя"
+                        })
+                        .clicked()
+                    {
+                        *volume = if *volume == 0.0 { 1.0 } else { 0.0 };
+                        let _ = self.store.save("profile", &self.profile);
+                        ui.close_menu();
+                    }
+                    if hosting {
+                        ui.separator();
+                        if ui.button("Кикнуть").clicked() {
+                            if let Err(e) = self.session.as_mut().unwrap().kick(&key) {
+                                self.error = e.to_string();
+                            }
+                            ui.close_menu();
+                        }
+                        if ui.button("Заблокировать до остановки сервера").clicked()
+                        {
+                            if let Err(e) = self.session.as_mut().unwrap().ban(&key) {
+                                self.error = e.to_string();
+                            }
+                            ui.close_menu();
+                        }
+                    }
+                }
+            });
+        }
+    }
+    fn member_card(&mut self, ctx: &egui::Context) {
+        let Some(key) = self.user_card.clone() else {
+            return;
+        };
+        let Some(member) = self
+            .session
+            .as_ref()
+            .and_then(|s| s.members.get(&key))
+            .cloned()
+        else {
+            self.user_card = None;
+            return;
+        };
+        let own = self.session.as_ref().unwrap().own_key() == key;
+        let mut open = true;
+        egui::Window::new("Участник")
+            .id(egui::Id::new("user-card"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(240.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui::avatar(
+                        ui,
+                        self.member_textures.get(&key).map(|(_, t)| t),
+                        &member.name,
+                        64.0,
+                    );
+                    ui.label(ui::heading(&member.name, 18.0));
+                });
+                if !own {
+                    ui.add_space(8.0);
+                    ui.label("Громкость для вас");
+                    let volume = self.profile.volumes.entry(key_string(&key)).or_insert(1.0);
+                    let mut percent = *volume * 100.0;
+                    if ui
+                        .add(egui::Slider::new(&mut percent, 0.0..=200.0).suffix(" %"))
+                        .changed()
+                    {
+                        *volume = percent / 100.0;
+                        let _ = self.store.save("profile", &self.profile);
+                    }
+                }
+            });
+        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.user_card = None;
+        }
+    }
+}
 fn texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(512);
-    limits.max_image_height = Some(512);
-    limits.max_alloc = Some(4 * 1024 * 1024);
+    limits.max_image_width = Some(1280);
+    limits.max_image_height = Some(1280);
+    limits.max_alloc = Some(16 * 1024 * 1024);
     reader.limits(limits);
     let img = reader.decode().ok()?.to_rgba8();
     Some(ctx.load_texture(
@@ -965,6 +1406,33 @@ fn texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui::Textur
     ))
 }
 fn main() {
+    let args: Vec<_> = std::env::args().collect();
+    if args.get(1).is_some_and(|s| s == "--update-worker") {
+        if thodtalk::updater::run_worker().is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.get(1).is_some_and(|s| s == "--apply-update") {
+        let result = (|| -> anyhow::Result<()> {
+            thodtalk::updater::apply(
+                std::path::Path::new(
+                    args.get(2)
+                        .ok_or_else(|| anyhow::anyhow!("Нет плана обновления"))?,
+                ),
+                args.get(3)
+                    .ok_or_else(|| anyhow::anyhow!("Нет процесса"))?
+                    .parse()?,
+            )
+        })();
+        if let Err(e) = result {
+            rfd::MessageDialog::new()
+                .set_title("Обновление ThodTalk")
+                .set_description(format!("Обновление не установлено: {e:#}"))
+                .show();
+        }
+        return;
+    }
     if std::env::args().any(|arg| arg == "--session-worker") {
         if thodtalk::worker::run().is_err() {
             std::process::exit(1);

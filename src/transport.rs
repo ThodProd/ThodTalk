@@ -34,7 +34,8 @@ impl Connection {
             let mut window = Instant::now();
             let mut count = 0;
             loop {
-                let packet = read_packet(&mut read);
+                let packet = read_packet(&mut read)
+                    .map_err(|e| anyhow::anyhow!("Сервер завершил сессию или связь потеряна: {e}"));
                 let failed = packet.is_err();
                 if window.elapsed() >= Duration::from_secs(1) {
                     window = Instant::now();
@@ -48,7 +49,12 @@ impl Connection {
                 if matches!(packet, Ok(Packet::Ping)) {
                     continue;
                 }
-                if incoming_tx.try_send(packet).is_err() || failed {
+                match incoming_tx.try_send(packet) {
+                    Err(mpsc::TrySendError::Full(Ok(Packet::Voice { .. }))) => continue,
+                    Err(_) => break,
+                    _ => {}
+                }
+                if failed {
                     break;
                 }
             }
@@ -75,11 +81,12 @@ impl Connection {
     }
     pub fn send(&self, packet: Packet) -> Result<()> {
         ensure!(self.outgoing.is_some(), "Соединение закрыто");
-        self.outgoing
-            .as_ref()
-            .unwrap()
-            .try_send(packet)
-            .map_err(|_| anyhow::anyhow!("Соединение закрыто или очередь переполнена"))
+        match self.outgoing.as_ref().unwrap().try_send(packet) {
+            Ok(()) | Err(mpsc::TrySendError::Full(Packet::Voice { .. })) => Ok(()),
+            Err(_) => Err(anyhow::anyhow!(
+                "Соединение закрыто или очередь переполнена"
+            )),
+        }
     }
 }
 

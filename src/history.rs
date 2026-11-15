@@ -11,6 +11,8 @@ pub struct Message {
     pub display_name: String,
     pub text: String,
     pub timestamp_ms: u64,
+    #[serde(default)]
+    pub image: Option<uuid::Uuid>,
 }
 fn default_channel() -> String {
     "Общий".into()
@@ -69,6 +71,7 @@ mod tests {
             display_name: "Друг".into(),
             text: "Привет".into(),
             timestamp_ms: 1,
+            image: None,
         };
         assert!(history.append(&store, message.clone()).unwrap());
         assert!(!history.append(&store, message.clone()).unwrap());

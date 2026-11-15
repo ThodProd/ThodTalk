@@ -15,6 +15,7 @@ pub struct Audio {
     pub encoded: mpsc::Receiver<Vec<u8>>,
     pub errors: mpsc::Receiver<String>,
     pub transmitting: Arc<AtomicBool>,
+    pub level: Arc<std::sync::atomic::AtomicU32>,
     pub deafened: Arc<AtomicBool>,
     queues: Arc<Mutex<BTreeMap<Vec<u8>, VecDeque<f32>>>>,
     decoders: BTreeMap<Vec<u8>, opus::Decoder>,
@@ -61,12 +62,15 @@ impl Audio {
         let error_in = errors_tx.clone();
         let error_out = errors_tx.clone();
         let enabled = transmitting.clone();
+        let level = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let meter = level.clone();
         let mut frame = Vec::with_capacity(960);
         let mut phase = 0u64;
         let channels = in_config.channels() as usize;
         let rate = in_config.sample_rate().0 as u64;
         let mut capture = move |samples: &[f32]| {
             if !enabled.load(Ordering::Relaxed) {
+                meter.store(0, Ordering::Relaxed);
                 frame.clear();
                 return;
             }
@@ -77,6 +81,13 @@ impl Audio {
                     phase -= rate;
                     frame.push((mono.clamp(-1.0, 1.0) * 32767.0) as i16);
                     if frame.len() == 960 {
+                        let rms = (frame
+                            .iter()
+                            .map(|s| (*s as f32 / 32768.0).powi(2))
+                            .sum::<f32>()
+                            / 960.0)
+                            .sqrt();
+                        meter.store(rms.to_bits(), Ordering::Relaxed);
                         let _ = frames_tx
                             .try_send(std::mem::replace(&mut frame, Vec::with_capacity(960)));
                     }
@@ -189,18 +200,19 @@ impl Audio {
             encoded,
             errors,
             transmitting,
+            level,
             deafened,
             queues,
             decoders: BTreeMap::new(),
         })
     }
-    pub fn play(&mut self, author: Vec<u8>, packet: &[u8]) -> Result<()> {
+    pub fn play(&mut self, author: Vec<u8>, packet: &[u8], gain: f32) -> Result<bool> {
         if self.deafened.load(Ordering::Relaxed) {
-            return Ok(());
+            return Ok(false);
         }
         if !self.decoders.contains_key(&author) {
             if self.decoders.len() >= 16 {
-                return Ok(());
+                return Ok(false);
             }
             self.decoders.insert(
                 author.clone(),
@@ -215,12 +227,19 @@ impl Audio {
             .decode(packet, &mut samples, false)?;
         if let Ok(mut queues) = self.queues.lock() {
             let queue = queues.entry(author).or_default();
-            if queue.len() > 4800 {
-                queue.clear();
+            if queue.is_empty() {
+                queue.extend(std::iter::repeat_n(0.0, 1920));
             }
-            queue.extend(samples[..len].iter().map(|s| *s as f32 / 32768.0));
+            if queue.len() > 9600 {
+                queue.drain(..queue.len() - 4800);
+            }
+            queue.extend(
+                samples[..len]
+                    .iter()
+                    .map(|s| *s as f32 / 32768.0 * gain.clamp(0.0, 2.0)),
+            );
         }
-        Ok(())
+        Ok(samples[..len].iter().any(|s| s.unsigned_abs() > 500))
     }
 }
 

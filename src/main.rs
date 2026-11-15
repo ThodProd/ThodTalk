@@ -330,6 +330,9 @@ impl App {
                 .collect();
             if let Err(e) = session.poll() {
                 self.error = format!("Соединение прервано: {e}. История сохранена локально.");
+                if self.profile.sounds && !self.deafened {
+                    thodtalk::sounds::play(thodtalk::sounds::Sound::Error);
+                }
                 disconnected = true;
             }
             if self.profile.sounds && !self.deafened {
@@ -1878,6 +1881,23 @@ impl App {
                                 RichText::new("Для подключения разрешите сеть в настройках.")
                                     .color(ui::danger(light)),
                             );
+                        }
+                        // Quick join last server
+                        if let Some(ref last_code) = self.profile.last_server_code {
+                            if !last_code.is_empty() {
+                                ui::card(ui, light, |ui| {
+                                    ui.label(ui::heading("Быстрое подключение", 17.0));
+                                    ui.label(
+                                        RichText::new("Переподключиться к последнему серверу")
+                                            .color(ui::muted(light)),
+                                    );
+                                    ui.add_space(6.0);
+                                    if ui.add_enabled(enabled, ui::primary("Присоединиться")).clicked() {
+                                        self.code = last_code.clone();
+                                        self.connect(false);
+                                    }
+                                });
+                            }
                         }
                         ui::card(ui, light, |ui| {
                             ui.label(ui::heading("Войти по приглашению", 17.0));

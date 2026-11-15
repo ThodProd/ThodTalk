@@ -213,6 +213,19 @@ impl Session {
             .into();
         }
     }
+    /// Graceful server shutdown: notify all members and close
+    pub fn shutdown(&mut self) -> Result<()> {
+        ensure!(self.hosting(), "Только хозяин может выключить сервер");
+        self.set_closed(true);
+        // Send goodbye message to all members
+        for key in self.members.keys() {
+            if key != &self.owner {
+                let _ = self.kick(key);
+            }
+        }
+        self.status = "Сервер завершает работу".into();
+        Ok(())
+    }
     pub fn ban(&mut self, key: &[u8]) -> Result<()> {
         ensure!(
             self.hosting() && key != self.owner,

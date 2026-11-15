@@ -18,7 +18,11 @@ use tokio::{
     runtime::Runtime,
 };
 
-fn trace(stage: &str) { if std::env::var_os("THODTALK_TEST_TRACE").is_some() { eprintln!("Сеть: {stage}"); } }
+fn trace(stage: &str) {
+    if std::env::var_os("THODTALK_TEST_TRACE").is_some() {
+        eprintln!("Сеть: {stage}");
+    }
+}
 const ALPN: &[u8] = b"thodtalk/3";
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Invitation {
@@ -49,11 +53,26 @@ fn runtime() -> Result<Arc<Runtime>> {
     ))
 }
 fn internet_builder() -> iroh::endpoint::Builder {
-    let builder = Endpoint::builder(presets::N0).transport_config(iroh::endpoint::QuicTransportConfig::builder().enable_segmentation_offload(false).build());
-    let builder = if std::env::var_os("THODTALK_TEST_RELAY_ONLY").is_some() { builder.clear_ip_transports() } else { builder };
+    let builder = Endpoint::builder(presets::N0).transport_config(
+        iroh::endpoint::QuicTransportConfig::builder()
+            .enable_segmentation_offload(false)
+            .build(),
+    );
+    let builder = if std::env::var_os("THODTALK_TEST_RELAY_ONLY").is_some() {
+        builder.clear_ip_transports()
+    } else {
+        builder
+    };
     if let Ok(region) = std::env::var("THODTALK_TEST_RELAY_REGION") {
-        let name = match region.as_str() { "asia" => "aps1-1", "europe"=>"euc1-1", "west"=>"usw1-1", _=>"use1-1" };
-        let url: iroh::RelayUrl = format!("https://{name}.relay.n0.iroh.link./").parse().unwrap();
+        let name = match region.as_str() {
+            "asia" => "aps1-1",
+            "europe" => "euc1-1",
+            "west" => "usw1-1",
+            _ => "use1-1",
+        };
+        let url: iroh::RelayUrl = format!("https://{name}.relay.n0.iroh.link./")
+            .parse()
+            .unwrap();
         return builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from_iter([url])));
     }
     builder
@@ -78,11 +97,7 @@ impl InternetHost {
     pub fn start() -> Result<Self> {
         let relay = Relay::start("127.0.0.1:0".parse()?)?;
         let runtime = runtime()?;
-        let endpoint = runtime.block_on(
-            internet_builder()
-                .alpns(vec![ALPN.to_vec()])
-                .bind(),
-        )?;
+        let endpoint = runtime.block_on(internet_builder().alpns(vec![ALPN.to_vec()]).bind())?;
         Self::start_with(relay, runtime, endpoint)
     }
     fn start_with(relay: Relay, runtime: Arc<Runtime>, endpoint: Endpoint) -> Result<Self> {
@@ -211,34 +226,64 @@ pub struct InternetGuest {
 impl InternetGuest {
     pub fn join(code: &str) -> Result<Self> {
         let (id, token) = parse_code(code)?;
-        let (tx,rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         let done = Arc::new(AtomicBool::new(false));
-        for relay_only in [false,true] {
-            let tx=tx.clone(); let done=done.clone();
+        for relay_only in [false, true] {
+            let tx = tx.clone();
+            let done = done.clone();
             std::thread::spawn(move || {
-                if relay_only { std::thread::sleep(Duration::from_secs(3)); }
-                if done.load(Ordering::Relaxed) { return; }
+                if relay_only {
+                    std::thread::sleep(Duration::from_secs(3));
+                }
+                if done.load(Ordering::Relaxed) {
+                    return;
+                }
                 let result = (|| -> Result<Self> {
                     let runtime = runtime()?;
                     let builder = internet_builder();
-                    let builder = if relay_only { builder.clear_ip_transports() } else { builder };
+                    let builder = if relay_only {
+                        builder.clear_ip_transports()
+                    } else {
+                        builder
+                    };
                     let endpoint = runtime.block_on(builder.bind())?;
-                    let local = if relay_only || std::env::var_os("THODTALK_TEST_PUBLIC_ONLY").is_some() { None } else { crate::lan::find(id) };
+                    let local =
+                        if relay_only || std::env::var_os("THODTALK_TEST_PUBLIC_ONLY").is_some() {
+                            None
+                        } else {
+                            crate::lan::find(id)
+                        };
                     if local.is_none() {
-                        if let Err(error)=runtime.block_on(tokio_wait_online(&endpoint)) { runtime.block_on(endpoint.close()); return Err(error); }
+                        if let Err(error) = runtime.block_on(tokio_wait_online(&endpoint)) {
+                            runtime.block_on(endpoint.close());
+                            return Err(error);
+                        }
                     }
-                    Self::join_with(runtime,endpoint,local.unwrap_or_else(||id.into()),token)
+                    Self::join_with(runtime, endpoint, local.unwrap_or_else(|| id.into()), token)
                 })();
-                if result.is_ok() { trace(if relay_only { "вход через совместимый relay-маршрут" } else { "вход с автоматическим выбором пути" }); }
-                let _=tx.send(result);
+                if result.is_ok() {
+                    trace(if relay_only {
+                        "вход через совместимый relay-маршрут"
+                    } else {
+                        "вход с автоматическим выбором пути"
+                    });
+                }
+                let _ = tx.send(result);
             });
         }
         drop(tx);
         let mut last = None;
         for result in rx {
-            match result { Ok(guest) => { done.store(true,Ordering::Relaxed); return Ok(guest); }, Err(e)=>last=Some(e) }
+            match result {
+                Ok(guest) => {
+                    done.store(true, Ordering::Relaxed);
+                    return Ok(guest);
+                }
+                Err(e) => last = Some(e),
+            }
         }
-        Err(last.unwrap_or_else(|| anyhow::anyhow!("Нет доступного маршрута"))).context("Сервер не существует, завершил сессию или недоступен")
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("Нет доступного маршрута")))
+            .context("Сервер не существует, завершил сессию или недоступен")
     }
 
     fn join_with(
@@ -264,7 +309,7 @@ impl InternetGuest {
                     .await
                     .context("Передача приглашения")?;
                 send.finish()?;
-                        trace("приглашение отправлено");
+                trace("приглашение отправлено");
                 let len =
                     recv.read_u32()
                         .await
@@ -285,7 +330,7 @@ impl InternetGuest {
                 trace("гость: QUIC установлен / открытие потока");
                 let (mut send, mut recv) = quic.open_bi().await?;
                 send.write_all(&[3]).await?;
-                        trace("отправлено подтверждение потока");
+                trace("отправлено подтверждение потока");
                 ensure!(
                     recv.read_u8().await? == 3,
                     "Сервер не подтвердил запуск сессии"
@@ -295,7 +340,13 @@ impl InternetGuest {
             .await
             .context("Сервер недоступен. Проверьте код, сеть и открыт ли вход")?
         });
-        let (quic, send, recv, invitation) = match setup { Ok(value) => value, Err(error) => { runtime.block_on(endpoint.close()); return Err(error); } };
+        let (quic, send, recv, invitation) = match setup {
+            Ok(value) => value,
+            Err(error) => {
+                runtime.block_on(endpoint.close());
+                return Err(error);
+            }
+        };
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let connection = Connection::connect(listener.local_addr()?)?;
         let (tcp, _) = listener.accept()?;

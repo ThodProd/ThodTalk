@@ -415,15 +415,25 @@ mod tests {
     #[test]
     fn verifies_manifest_and_rejects_case_collisions() {
         fn package(duplicate: bool) -> Vec<u8> {
-            let mut z=zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-            z.start_file("manifest.json",zip::write::FileOptions::default()).unwrap();
+            let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            z.start_file("manifest.json", zip::write::FileOptions::default())
+                .unwrap();
             z.write_all(br#"{"schemaVersion":1,"hubApi":1,"id":"thodtalk","version":"0.3.0","platform":"win-x64","mode":"standalone","launch":{"executable":"app/thodtalk.exe"}}"#).unwrap();
-            z.start_file("app/thodtalk.exe",zip::write::FileOptions::default()).unwrap(); z.write_all(b"fixture").unwrap();
-            if duplicate { z.start_file("app/ThodTalk.exe",zip::write::FileOptions::default()).unwrap(); z.write_all(b"other").unwrap(); }
+            z.start_file("app/thodtalk.exe", zip::write::FileOptions::default())
+                .unwrap();
+            z.write_all(b"fixture").unwrap();
+            if duplicate {
+                z.start_file("app/ThodTalk.exe", zip::write::FileOptions::default())
+                    .unwrap();
+                z.write_all(b"other").unwrap();
+            }
             z.finish().unwrap().into_inner()
         }
-        let valid=tempfile::tempdir().unwrap(); assert!(extract(&package(false),valid.path(),"0.3.0").is_ok());
-        let mismatch=tempfile::tempdir().unwrap(); assert!(extract(&package(false),mismatch.path(),"0.3.1").is_err());
-        let duplicate=tempfile::tempdir().unwrap(); assert!(extract(&package(true),duplicate.path(),"0.3.0").is_err());
+        let valid = tempfile::tempdir().unwrap();
+        assert!(extract(&package(false), valid.path(), "0.3.0").is_ok());
+        let mismatch = tempfile::tempdir().unwrap();
+        assert!(extract(&package(false), mismatch.path(), "0.3.1").is_err());
+        let duplicate = tempfile::tempdir().unwrap();
+        assert!(extract(&package(true), duplicate.path(), "0.3.0").is_err());
     }
 }

@@ -21,7 +21,9 @@ fn shared_code_two_guests_chat_and_kick() {
     if let Ok(path) = std::env::var("THODTALK_TEST_TRACE") {
         let file = std::fs::File::create(path).unwrap();
         let _ = tracing_subscriber::fmt()
-            .with_env_filter("iroh=debug,iroh::socket::transports::relay=trace,iroh_relay=trace,noq=debug")
+            .with_env_filter(
+                "iroh=debug,iroh::socket::transports::relay=trace,iroh_relay=trace,noq=debug",
+            )
             .with_ansi(false)
             .with_writer(std::sync::Mutex::new(file))
             .try_init();

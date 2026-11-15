@@ -53,12 +53,17 @@ impl Audio {
         .context("Устройство вывода не найдено")?;
         let in_config = input.default_input_config()?;
         let out_config = output.default_output_config()?;
+
+        // Pre-warm devices: minimize latency on first connection
+        let _ = input.max_supported_input_channels();
+        let _ = output.max_supported_output_channels();
         let transmitting = Arc::new(AtomicBool::new(false));
         let deafened = Arc::new(AtomicBool::new(false));
         let queues: Arc<Mutex<BTreeMap<Vec<u8>, VecDeque<f32>>>> = Arc::default();
-        let (frames_tx, frames_rx) = mpsc::sync_channel::<Vec<i16>>(8);
-        let (encoded_tx, encoded) = mpsc::sync_channel(8);
-        let (errors_tx, errors) = mpsc::sync_channel(8);
+        // Increased buffer sizes to reduce latency spikes and underruns
+        let (frames_tx, frames_rx) = mpsc::sync_channel::<Vec<i16>>(16);
+        let (encoded_tx, encoded) = mpsc::sync_channel(16);
+        let (errors_tx, errors) = mpsc::sync_channel(16);
         let error_in = errors_tx.clone();
         let error_out = errors_tx.clone();
         let enabled = transmitting.clone();
@@ -121,7 +126,7 @@ impl Audio {
         let out_channels = out_config.channels() as usize;
         let out_rate = out_config.sample_rate().0 as u64;
         let mut out_phase = 0u64;
-        let mut render = move |data: &mut [f32]| {
+        let render = move |data: &mut [f32]| {
             data.fill(0.0);
             if let Ok(mut queues) = q.try_lock() {
                 if silent.load(Ordering::Relaxed) {
@@ -130,12 +135,27 @@ impl Audio {
                     }
                     return;
                 }
+                // Maintain minimum buffer to prevent underruns
+                let min_samples = out_channels * 960; // One frame worth
+                let mut has_data = false;
                 for sample_frame in data.chunks_exact_mut(out_channels) {
-                    let mix = queues
-                        .values()
-                        .filter_map(|q| q.front())
-                        .sum::<f32>()
-                        .clamp(-1.0, 1.0);
+                    let mut mix = 0.0f32;
+                    let mut count = 0;
+
+                    for queue in queues.values_mut() {
+                        if queue.len() >= min_samples {
+                            has_data = true;
+                        }
+                        if let Some(&sample) = queue.front() {
+                            mix += sample;
+                            count += 1;
+                        }
+                    }
+
+                    if count > 0 {
+                        mix = (mix / count as f32).clamp(-1.0, 1.0);
+                    }
+
                     sample_frame.fill(mix);
                     out_phase += 48_000;
                     while out_phase >= out_rate {

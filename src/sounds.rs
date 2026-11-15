@@ -2,16 +2,36 @@
 pub enum Sound {
     Join,
     Leave,
+    VoiceJoin,
+    VoiceLeave,
+    Mute,
+    Unmute,
+    Deafen,
+    Undeafen,
     Sent,
     Received,
+    MessageMention,
+    UserJoinChannel,
+    UserLeaveChannel,
+    Error,
 }
 pub fn play(sound: Sound) {
     std::thread::spawn(move || {
         let notes: &[f32] = match sound {
             Sound::Join => &[660.0, 880.0],
             Sound::Leave => &[660.0, 440.0],
-            Sound::Sent => &[880.0],
+            Sound::VoiceJoin => &[740.0, 988.0],
+            Sound::VoiceLeave => &[740.0, 554.0],
+            Sound::Mute => &[520.0, 390.0],
+            Sound::Unmute => &[390.0, 520.0],
+            Sound::Deafen => &[440.0, 330.0],
+            Sound::Undeafen => &[330.0, 440.0],
+            Sound::Sent => &[880.0, 880.0],
             Sound::Received => &[550.0, 740.0],
+            Sound::MessageMention => &[800.0, 1000.0, 800.0],
+            Sound::UserJoinChannel => &[700.0, 900.0],
+            Sound::UserLeaveChannel => &[700.0, 500.0],
+            Sound::Error => &[400.0, 300.0],
         };
         let rate = 22050u32;
         let n = rate as usize * 65 / 1000;
@@ -40,11 +60,7 @@ pub fn play(sound: Sound) {
         wav.extend(pcm);
         #[cfg(windows)]
         unsafe {
-            PlaySoundW(
-                wav.as_ptr().cast(),
-                std::ptr::null_mut(),
-                0x0004 | 0x0002 | 0x0010,
-            );
+            PlaySoundW(wav.as_ptr().cast(), std::ptr::null_mut(), 0x0004 | 0x0002);
         }
     });
 }

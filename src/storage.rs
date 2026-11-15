@@ -33,6 +33,14 @@ pub struct Profile {
     pub auto_update: bool,
     #[serde(default)]
     pub volumes: std::collections::BTreeMap<String, f32>,
+    #[serde(default)]
+    pub muted_users: std::collections::BTreeSet<Vec<u8>>,
+    #[serde(default)]
+    pub last_server_code: Option<String>,
+    #[serde(default)]
+    pub ffmpeg_noise_suppression: bool,
+    #[serde(default)]
+    pub voice_enhancement: bool,
 }
 
 impl Default for Profile {
@@ -53,6 +61,10 @@ impl Default for Profile {
             sounds: true,
             auto_update: true,
             volumes: Default::default(),
+            muted_users: Default::default(),
+            last_server_code: None,
+            ffmpeg_noise_suppression: false,
+            voice_enhancement: false,
         }
     }
 }

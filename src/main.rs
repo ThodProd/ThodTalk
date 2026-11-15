@@ -61,12 +61,18 @@ struct App {
     settings_tab: usize,
     choosing_key: Option<usize>,
     user_card: Option<Vec<u8>>,
+    user_card_fresh: bool,
+    preview_image: Option<uuid::Uuid>,
+    preview_zoom: f32,
     speaking: std::collections::BTreeMap<Vec<u8>, std::time::Instant>,
     image_textures: std::collections::BTreeMap<uuid::Uuid, egui::TextureHandle>,
     update_rx: Option<mpsc::Receiver<anyhow::Result<Option<thodtalk::updater::Prepared>>>>,
     update_ready: Option<thodtalk::updater::Prepared>,
     update_status: String,
     update_started: bool,
+    reconnect_attempts: u32,
+    last_disconnect_time: Option<std::time::Instant>,
+    last_hosting: bool,
     _lock: std::fs::File,
 }
 impl App {
@@ -83,6 +89,7 @@ impl App {
         };
         let storage_error = !error.is_empty();
         let (inputs, outputs) = thodtalk::audio::devices();
+        let last_server = profile.last_server_code.clone();
         let mut app = Self {
             store,
             profile,
@@ -121,12 +128,18 @@ impl App {
             settings_tab: 0,
             choosing_key: None,
             user_card: None,
+            user_card_fresh: false,
+            preview_image: None,
+            preview_zoom: 1.0,
             speaking: Default::default(),
             image_textures: Default::default(),
             update_rx: None,
             update_ready: None,
             update_status: String::new(),
             update_started: false,
+            reconnect_attempts: 0,
+            last_disconnect_time: None,
+            last_hosting: false,
             _lock: lock,
         };
         app.input_device = app.profile.input_device.clone();
@@ -134,6 +147,12 @@ impl App {
         app.ptt = app.profile.push_to_talk;
         app.profile.network_allowed = true;
         app.profile.microphone_allowed = true;
+        // Auto-connect to last server if available
+        if let Some(server_code) = last_server {
+            if !saved || app.error.is_empty() {
+                app.code = server_code;
+            }
+        }
         ui::theme(&cc.egui_ctx, app.profile.light_theme);
         app.update_avatar(&cc.egui_ctx);
         app
@@ -146,8 +165,16 @@ impl App {
             return;
         }
         let path = self.store.root.clone();
-        let profile = self.profile.clone();
+        let mut profile = self.profile.clone();
         let code = self.code.clone();
+
+        // Remember last server connection
+        if !hosting && !code.is_empty() {
+            profile.last_server_code = Some(code.clone());
+            let _ = self.store.save("profile", &profile);
+        }
+
+        self.last_hosting = hosting;
         let (tx, rx) = mpsc::sync_channel(1);
         self.connecting = Some(rx);
         self.error.clear();
@@ -162,6 +189,28 @@ impl App {
     fn sound(&self, sound: thodtalk::sounds::Sound) {
         if self.profile.sounds && !self.deafened {
             thodtalk::sounds::play(sound);
+        }
+    }
+    fn toggle_mute(&mut self) {
+        self.muted = !self.muted;
+        self.voice_state();
+        if !self.deafened {
+            self.sound(if self.muted {
+                thodtalk::sounds::Sound::Mute
+            } else {
+                thodtalk::sounds::Sound::Unmute
+            });
+        }
+    }
+    fn toggle_deafen(&mut self) {
+        self.deafened = !self.deafened;
+        self.voice_state();
+        if self.profile.sounds {
+            thodtalk::sounds::play(if self.deafened {
+                thodtalk::sounds::Sound::Deafen
+            } else {
+                thodtalk::sounds::Sound::Undeafen
+            });
         }
     }
     fn stop_voice(&mut self) {
@@ -235,13 +284,23 @@ impl App {
             let deafen = egui::Key::from_name(&self.profile.deafen_key)
                 .is_some_and(|k| ctx.input(|i| i.key_pressed(k)));
             if mute {
-                self.muted = !self.muted;
+                self.toggle_mute();
             }
             if deafen {
-                self.deafened = !self.deafened;
+                self.toggle_deafen();
             }
-            if mute || deafen {
-                self.voice_state();
+        }
+
+        // Auto-reconnect after disconnection (up to 3 attempts over ~2 min)
+        if let Some(last_dc) = self.last_disconnect_time {
+            if self.session.is_none() && self.connecting.is_none() && self.reconnect_attempts < 3 {
+                let wait_ms = 15_000 * (1 << self.reconnect_attempts); // 15s, 30s, 60s
+                if last_dc.elapsed() > Duration::from_millis(wait_ms) {
+                    self.reconnect_attempts += 1;
+                    if !self.code.is_empty() {
+                        self.connect(!self.last_hosting);
+                    }
+                }
             }
         }
 
@@ -251,9 +310,13 @@ impl App {
                 match result {
                     Ok(session) => {
                         self.session = Some(session);
+                        self.last_disconnect_time = None;
+                        self.reconnect_attempts = 0;
                         self.code.clear();
                     }
-                    Err(e) => self.error = format!("Подключение не удалось: {e}"),
+                    Err(e) => {
+                        self.error = format!("Подключение не удалось: {e}");
+                    }
                 }
             }
         }
@@ -290,9 +353,9 @@ impl App {
                             && session.members.get(k).map(|m| &m.voice) != Some(v)
                     });
                     if joined {
-                        thodtalk::sounds::play(thodtalk::sounds::Sound::Join);
+                        thodtalk::sounds::play(thodtalk::sounds::Sound::VoiceJoin);
                     } else if left {
-                        thodtalk::sounds::play(thodtalk::sounds::Sound::Leave);
+                        thodtalk::sounds::play(thodtalk::sounds::Sound::VoiceLeave);
                     }
                 }
             }
@@ -325,13 +388,14 @@ impl App {
                     }
                 }
                 for (author, channel, data) in session.voice_in.drain(..) {
-                    if self.voice_channel.as_ref() == Some(&channel) {
+                    if self.voice_channel.as_ref() == Some(&channel) && !self.profile.muted_users.contains(&author) {
                         let gain = self
                             .profile
                             .volumes
                             .get(&key_string(&author))
                             .copied()
-                            .unwrap_or(1.0);
+                            .unwrap_or(1.0)
+                            .clamp(0.0, 1.5);
                         match audio.play(author.clone(), &data, gain) {
                             Ok(true) => {
                                 self.speaking.insert(author, std::time::Instant::now());
@@ -361,6 +425,8 @@ impl App {
         self.speaking.clear();
         self.user_card = None;
         self.page = Page::Home;
+        self.last_disconnect_time = Some(std::time::Instant::now());
+        self.reconnect_attempts = 0;
     }
     fn open_settings(&mut self) {
         self.settings_backup = Some(self.profile.clone());
@@ -773,8 +839,7 @@ impl App {
         .on_hover_text(deaf_tip)
         .clicked()
         {
-            self.deafened = !self.deafened;
-            self.voice_state();
+            self.toggle_deafen();
         }
         let mic_off = self.muted || self.deafened;
         let mic_tip = format!(
@@ -801,8 +866,7 @@ impl App {
         .on_hover_text(mic_tip)
         .clicked()
         {
-            self.muted = !self.muted;
-            self.voice_state();
+            self.toggle_mute();
         }
     }
 
@@ -924,6 +988,7 @@ impl App {
             }
             if response.clicked() {
                 self.user_card = Some(key.clone());
+                self.user_card_fresh = true;
             }
             response.context_menu(|ui| {
                 if key != own {
@@ -938,6 +1003,23 @@ impl App {
                         .clicked()
                     {
                         *volume = if *volume == 0.0 { 1.0 } else { 0.0 };
+                        let _ = self.store.save("profile", &self.profile);
+                        ui.close_menu();
+                    }
+                    let is_muted = self.profile.muted_users.contains(&key);
+                    if ui
+                        .button(if is_muted {
+                            "Включить голос"
+                        } else {
+                            "Отключить голос"
+                        })
+                        .clicked()
+                    {
+                        if is_muted {
+                            self.profile.muted_users.remove(&key);
+                        } else {
+                            self.profile.muted_users.insert(key.clone());
+                        }
                         let _ = self.store.save("profile", &self.profile);
                         ui.close_menu();
                     }
@@ -976,50 +1058,402 @@ impl App {
             self.user_card = None;
             return;
         };
-        let own = self.session.as_ref().unwrap().own_key() == key;
+        let (own, hosting) = self
+            .session
+            .as_ref()
+            .map(|s| (s.own_key() == key, s.hosting()))
+            .unwrap_or((false, false));
+        let texture = self.member_textures.get(&key).map(|(_, t)| t.clone());
+        let volume_key = key_string(&key);
+        let mut volume = self
+            .profile
+            .volumes
+            .get(&volume_key)
+            .copied()
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.5);
+        let mut percent = volume * 100.0;
+        let mut local_mute = volume <= 0.0;
+        let mut volume_changed = false;
         let mut open = true;
-        egui::Window::new("Участник")
+        let mut kick = false;
+        let mut ban = false;
+
+        let frame = Frame::new()
+            .fill(ui::surface(light))
+            .stroke(egui::Stroke::new(1.0, ui::line(light)))
+            .corner_radius(12)
+            .inner_margin(Margin::same(16));
+        let window_response = egui::Window::new("Участник")
             .id(egui::Id::new("user-card"))
-            .open(&mut open)
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
-            .default_width(260.0)
+            .default_width(300.0)
+            .default_pos(pos2(ctx.screen_rect().right() - 320.0, 96.0))
+            .frame(frame)
             .show(ctx, |ui| {
+                ui.set_width(300.0);
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 14.0;
-                    ui::Avatar::new(
-                        self.member_textures.get(&key).map(|(_, t)| t),
-                        &member.name,
-                        64.0,
-                    )
-                    .show(ui);
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    ui::Avatar::new(texture.as_ref(), &member.name, 56.0)
+                        .status(
+                            if member.voice.is_some() {
+                                ui::GREEN
+                            } else {
+                                ui::muted(light)
+                            },
+                            ui::surface(light),
+                        )
+                        .show(ui);
                     ui.vertical(|ui| {
                         ui.label(
                             ui::heading(&member.name, 18.0)
                                 .color(ui::name_color(&member.name, light)),
                         );
-                        if own {
-                            ui.label(RichText::new("Это вы").size(12.5).color(ui::muted(light)));
+                        let status = if own {
+                            "Это вы".to_owned()
+                        } else if let Some(channel) = &member.voice {
+                            format!("В голосовом канале #{channel}")
+                        } else {
+                            "В сети".to_owned()
+                        };
+                        ui.label(RichText::new(status).size(12.5).color(ui::muted(light)));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        if ui::icon_btn_sized(
+                            ui,
+                            light,
+                            ui::Icon::Close,
+                            ui::Tone::Normal,
+                            false,
+                            28.0,
+                        )
+                        .on_hover_text("Закрыть")
+                        .clicked()
+                        {
+                            open = false;
                         }
                     });
                 });
+
                 if !own {
-                    ui.add_space(10.0);
-                    ui::field_label(ui, "ГРОМКОСТЬ ДЛЯ ВАС", light);
-                    let volume = self.profile.volumes.entry(key_string(&key)).or_insert(1.0);
-                    let mut percent = *volume * 100.0;
-                    ui.spacing_mut().slider_width = ui.available_width() - 70.0;
-                    if ui
-                        .add(egui::Slider::new(&mut percent, 0.0..=200.0).suffix(" %"))
-                        .changed()
-                    {
-                        *volume = percent / 100.0;
+                    ui.add_space(4.0);
+                    ui::divider(ui, light);
+                    ui.horizontal(|ui| {
+                        ui::icon_label(ui, ui::Icon::Speaker, 16.0, ui::muted(light));
+                        ui.label(RichText::new("Громкость").size(14.0));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!("{percent:.0}%"))
+                                    .size(13.0)
+                                    .strong()
+                                    .color(ui::muted(light)),
+                            );
+                        });
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if ui::icon_btn_sized(
+                            ui,
+                            light,
+                            ui::Icon::Minus,
+                            ui::Tone::Normal,
+                            false,
+                            28.0,
+                        )
+                        .on_hover_text("Тише")
+                        .clicked()
+                        {
+                            percent = (percent - 10.0).max(0.0);
+                            volume = percent / 100.0;
+                            volume_changed = true;
+                        }
+                        let slider_width = (ui.available_width() - 72.0).max(90.0);
+                        ui.spacing_mut().slider_width = slider_width;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut percent, 0.0..=150.0)
+                                    .show_value(false)
+                                    .step_by(1.0),
+                            )
+                            .changed()
+                        {
+                            volume = percent / 100.0;
+                            volume_changed = true;
+                        }
+                        if ui::icon_btn_sized(
+                            ui,
+                            light,
+                            ui::Icon::Plus,
+                            ui::Tone::Normal,
+                            false,
+                            28.0,
+                        )
+                        .on_hover_text("Громче")
+                        .clicked()
+                        {
+                            percent = (percent + 10.0).min(150.0);
+                            volume = percent / 100.0;
+                            volume_changed = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        if ui
+                            .small_button("0%")
+                            .on_hover_text("Полностью заглушить")
+                            .clicked()
+                        {
+                            percent = 0.0;
+                            volume = 0.0;
+                            volume_changed = true;
+                        }
+                        if ui
+                            .small_button("100%")
+                            .on_hover_text("Стандартная громкость")
+                            .clicked()
+                        {
+                            percent = 100.0;
+                            volume = 1.0;
+                            volume_changed = true;
+                        }
+                        if ui
+                            .small_button("150%")
+                            .on_hover_text("Максимальная громкость")
+                            .clicked()
+                        {
+                            percent = 150.0;
+                            volume = 1.5;
+                            volume_changed = true;
+                        }
+                    });
+                    local_mute = volume <= 0.0;
+                    let mute_before = local_mute;
+                    ui.add_space(4.0);
+                    ui::setting_row(
+                        ui,
+                        light,
+                        "Заглушить для себя",
+                        "Не слышать этого участника",
+                        |ui| {
+                            let mut value = local_mute;
+                            if ui::toggle(ui, &mut value).changed() {
+                                local_mute = value;
+                            }
+                        },
+                    );
+                    if local_mute != mute_before {
+                        volume = if local_mute { 0.0 } else { 1.0 };
+                        percent = volume * 100.0;
+                        volume_changed = true;
+                    }
+
+                    let mut is_globally_muted = self.profile.muted_users.contains(&key);
+                    let mute_before_global = is_globally_muted;
+                    ui::setting_row(
+                        ui,
+                        light,
+                        "Отключить голос",
+                        "Полностью отключить голос этого участника",
+                        |ui| {
+                            if ui::toggle(ui, &mut is_globally_muted).changed() {
+                                // Toggle passed
+                            }
+                        },
+                    );
+                    if is_globally_muted != mute_before_global {
+                        if is_globally_muted {
+                            self.profile.muted_users.insert(key.clone());
+                        } else {
+                            self.profile.muted_users.remove(&key);
+                        }
                         let _ = self.store.save("profile", &self.profile);
+                    }
+
+                    if hosting {
+                        ui::divider(ui, light);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let width = (ui.available_width() - 8.0) / 2.0;
+                            let kick_btn = egui::Button::new(
+                                RichText::new("Кикнуть")
+                                    .size(14.0)
+                                    .strong()
+                                    .color(ui::danger(light)),
+                            )
+                            .fill(ui::danger_bg(light))
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                ui::danger(light).gamma_multiply(0.35),
+                            ))
+                            .min_size(vec2(width, 34.0));
+                            if ui
+                                .add(kick_btn)
+                                .on_hover_text("Отключить от сервера")
+                                .clicked()
+                            {
+                                kick = true;
+                            }
+                            let ban_btn = egui::Button::new(
+                                RichText::new("Заблокировать")
+                                    .size(14.0)
+                                    .strong()
+                                    .color(ui::danger(light)),
+                            )
+                            .fill(ui::danger_bg(light))
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                ui::danger(light).gamma_multiply(0.35),
+                            ))
+                            .min_size(vec2(width, 34.0));
+                            if ui
+                                .add(ban_btn)
+                                .on_hover_text("Заблокировать до остановки сервера")
+                                .clicked()
+                            {
+                                ban = true;
+                            }
+                        });
                     }
                 }
             });
-        if !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+
+        if volume_changed {
+            volume = volume.clamp(0.0, 1.5);
+            self.profile.volumes.insert(volume_key, volume);
+            let _ = self.store.save("profile", &self.profile);
+        }
+        if ban {
+            if let Some(session) = self.session.as_mut() {
+                if let Err(e) = session.ban(&key) {
+                    self.error = e.to_string();
+                }
+            }
             self.user_card = None;
+        } else if kick {
+            if let Some(session) = self.session.as_mut() {
+                if let Err(e) = session.kick(&key) {
+                    self.error = e.to_string();
+                }
+            }
+            self.user_card = None;
+        }
+        let card_rect = window_response
+            .map(|r| r.response.rect)
+            .unwrap_or(Rect::NOTHING);
+        let clicked_outside = ctx.input(|i| i.pointer.any_click())
+            && !card_rect.contains(
+                ctx.input(|i| i.pointer.interact_pos())
+                    .unwrap_or(pos2(-1.0, -1.0)),
+            );
+        if !open
+            || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            || (!self.user_card_fresh && clicked_outside)
+        {
+            self.user_card = None;
+        }
+        self.user_card_fresh = false;
+    }
+
+    fn image_preview(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.preview_image else {
+            return;
+        };
+        if !self.image_textures.contains_key(&id) {
+            if let Ok(Some(bytes)) = self.store.load::<Vec<u8>>(&format!("image-{id}")) {
+                if let Some(image) = texture(ctx, &format!("image-{id}"), &bytes) {
+                    self.image_textures.insert(id, image);
+                }
+            }
+        }
+        let Some(image) = self.image_textures.get(&id).cloned() else {
+            self.preview_image = None;
+            return;
+        };
+        let screen = ctx.screen_rect();
+        let mut close = false;
+        let mut save = false;
+
+        // Mouse wheel zoom
+        ctx.input(|i| {
+            if i.scroll_delta.y > 0.0 {
+                self.preview_zoom = (self.preview_zoom * 1.2).min(8.0);
+            } else if i.scroll_delta.y < 0.0 {
+                self.preview_zoom = (self.preview_zoom / 1.2).max(0.5);
+            }
+        });
+
+        egui::Area::new(egui::Id::new("image-preview"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (bg_rect, bg_response) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter()
+                    .rect_filled(bg_rect, 0.0, egui::Color32::from_black_alpha(210));
+                let source = image.size_vec2();
+                let max = egui::vec2(screen.width() * 0.86, screen.height() * 0.82);
+                let auto_scale = (max.x / source.x).min(max.y / source.y).min(4.0);
+                let scale = auto_scale * self.preview_zoom;
+                let size = source * scale;
+                let image_rect = Rect::from_center_size(bg_rect.center(), size);
+                let response = ui.put(
+                    image_rect,
+                    egui::Image::new((image.id(), size))
+                        .corner_radius(10)
+                        .sense(Sense::click()),
+                );
+                if bg_response.clicked() && !response.hovered() {
+                    close = true;
+                }
+                response.context_menu(|ui| {
+                    if ui.button("Сохранить на компьютер").clicked() {
+                        save = true;
+                        ui.close_menu();
+                    }
+                });
+                let close_rect = Rect::from_min_size(
+                    pos2(screen.right() - 52.0, screen.top() + 16.0),
+                    Vec2::splat(32.0),
+                );
+                if ui
+                    .put(
+                        close_rect,
+                        egui::Button::new(
+                            RichText::new("×").size(28.0).color(egui::Color32::WHITE),
+                        )
+                        .frame(false),
+                    )
+                    .clicked()
+                {
+                    close = true;
+                }
+                let zoom_text = format!("×{:.1}", self.preview_zoom);
+                ui.painter().text(
+                    pos2(screen.center().x, screen.bottom() - 48.0),
+                    egui::Align2::CENTER_CENTER,
+                    format!("Скролл для зума {}", zoom_text),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_white_alpha(180),
+                );
+                ui.painter().text(
+                    pos2(screen.center().x, screen.bottom() - 28.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Клик по фону — закрыть · ПКМ по картинке — сохранить",
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_white_alpha(180),
+                );
+            });
+        if save {
+            if let Err(e) = save_attachment(&self.store, id) {
+                self.error = e.to_string();
+            }
+        }
+        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.preview_image = None;
+            self.preview_zoom = 1.0;
         }
     }
 
@@ -1163,13 +1597,15 @@ impl App {
     fn composer(&mut self, ctx: &egui::Context) {
         let light = self.profile.light_theme;
         let ready = self.session.as_ref().is_some_and(|s| s.ready());
-        let composer_id = egui::Id::new("composer");
+        // Важно: ID текстового поля не должен совпадать с ID панели "composer",
+        // иначе egui хранит фокус и состояние панели в одной ячейке памяти.
+        let composer_id = egui::Id::new("composer-input");
         let shortcut = ctx.memory(|m| m.has_focus(composer_id))
             && ctx.input(|i| !i.modifiers.shift && !i.modifiers.alt)
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         let mut send = false;
         let mut attach = false;
-        egui::TopBottomPanel::bottom("composer")
+        egui::TopBottomPanel::bottom("composer-panel")
             .frame(Frame::new().fill(ui::bg(light)).inner_margin(Margin {
                 left: 16,
                 right: 16,
@@ -1186,48 +1622,41 @@ impl App {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
-                            ui.add_enabled_ui(ready, |ui| {
-                                attach = ui::icon_btn(
-                                    ui,
-                                    light,
-                                    ui::Icon::Plus,
-                                    ui::Tone::Normal,
-                                    false,
-                                )
-                                .on_hover_text("Прикрепить изображение")
-                                .clicked();
-                            });
-                            let width = (ui.available_width() - 34.0 - 8.0).max(80.0);
-                            let response = egui::ScrollArea::vertical()
-                                .id_salt("composer-scroll")
-                                .max_height(120.0)
-                                .auto_shrink([true, true])
-                                .show(ui, |ui| {
-                                    ui.add(
+                            attach = ui::composer_btn(
+                                ui,
+                                light,
+                                ui::Icon::Plus,
+                                ui::Tone::Normal,
+                                ready,
+                            )
+                            .on_hover_text("Прикрепить изображение")
+                            .clicked();
+
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let can_send = ready && !self.draft.trim().is_empty();
+                                let clicked = ui::composer_send(ui, light, can_send)
+                                    .on_hover_text("Отправить · Enter")
+                                    .clicked();
+
+                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                    let response = ui.add_sized(
+                                        [ui.available_width(), 40.0],
                                         egui::TextEdit::multiline(&mut self.draft)
                                             .id(composer_id)
                                             .frame(false)
                                             .desired_rows(1)
-                                            .desired_width(width)
                                             .hint_text(ui::hint(
                                                 format!("Написать в #{}", self.channel),
                                                 light,
                                             ))
                                             .char_limit(16000)
-                                            .margin(vec2(4.0, 8.0)),
-                                    )
-                                })
-                                .inner;
-                            let can_send = ready && !self.draft.trim().is_empty();
-                            let clicked = ui
-                                .add_enabled_ui(can_send, |ui| {
-                                    ui::send_btn(ui, light, can_send)
-                                        .on_hover_text("Отправить · Enter")
-                                        .clicked()
-                                })
-                                .inner;
-                            send = clicked
-                                || ((response.has_focus() || response.lost_focus()) && shortcut);
+                                            .margin(vec2(4.0, 10.0)),
+                                    );
+                                    send = clicked
+                                        || ((response.has_focus() || response.lost_focus())
+                                            && shortcut);
+                                });
+                            });
                         });
                     });
             });
@@ -1321,7 +1750,9 @@ impl App {
                                         self.member_textures.get(&m.author_key).map(|(_, t)| t);
                                     ui::Avatar::new(avatar, &m.display_name, 38.0).show(ui);
                                 } else {
-                                    ui.add_space(38.0);
+                                    // Фиксированная колонка аватара, чтобы продолжение
+                                    // сообщения начиналось ровно под текстом первого.
+                                    let _ = ui.allocate_exact_size(Vec2::splat(38.0), Sense::hover());
                                 }
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 2.0;
@@ -1351,12 +1782,26 @@ impl App {
                                         });
                                     }
                                     if let Some(id) = m.image {
-                                        if !show_image(
+                                        if let Some(response) = show_image(
                                             ui,
                                             &self.store,
                                             &mut self.image_textures,
                                             id,
                                         ) {
+                                            if response.clicked() {
+                                                self.preview_image = Some(id);
+                                            }
+                                            response.context_menu(|ui| {
+                                                if ui.button("Сохранить на компьютер").clicked() {
+                                                    if let Err(e) =
+                                                        save_attachment(&self.store, id)
+                                                    {
+                                                        self.error = e.to_string();
+                                                    }
+                                                    ui.close_menu();
+                                                }
+                                            });
+                                        } else {
                                             ui.add(
                                                 egui::Label::new(
                                                     RichText::new("Изображение недоступно")
@@ -1564,12 +2009,29 @@ impl App {
                                                     );
                                                 });
                                                 if let Some(id) = m.image {
-                                                    if !show_image(
+                                                    if let Some(response) = show_image(
                                                         ui,
                                                         &self.store,
                                                         &mut self.image_textures,
                                                         id,
                                                     ) {
+                                                        if response.clicked() {
+                                                            self.preview_image = Some(id);
+                                                        }
+                                                        response.context_menu(|ui| {
+                                                            if ui
+                                                                .button("Сохранить на компьютер")
+                                                                .clicked()
+                                                            {
+                                                                if let Err(e) =
+                                                                    save_attachment(&self.store, id)
+                                                                {
+                                                                    self.error = e.to_string();
+                                                                }
+                                                                ui.close_menu();
+                                                            }
+                                                        });
+                                                    } else {
                                                         ui.label(
                                                             RichText::new("Изображение недоступно")
                                                                 .size(14.0)
@@ -1812,6 +2274,26 @@ impl App {
                             ui::toggle(ui, &mut self.ptt);
                         },
                     );
+                    ui::divider(ui, light);
+                    ui::setting_row(
+                        ui,
+                        light,
+                        "Шумоподавление (FFmpeg)",
+                        "Удаляет фоновый шум через встроенный фильтр",
+                        |ui| {
+                            ui::toggle(ui, &mut self.profile.ffmpeg_noise_suppression);
+                        },
+                    );
+                    ui::divider(ui, light);
+                    ui::setting_row(
+                        ui,
+                        light,
+                        "Улучшение голоса",
+                        "Усиливает чистоту и яркость голоса",
+                        |ui| {
+                            ui::toggle(ui, &mut self.profile.voice_enhancement);
+                        },
+                    );
                 });
                 ui.add_space(10.0);
                 ui.label(
@@ -1998,6 +2480,7 @@ impl eframe::App for App {
         if self.editing {
             self.settings_screen(ctx);
             self.member_card(ctx);
+            self.image_preview(ctx);
             return;
         }
         self.error_bar(ctx);
@@ -2023,6 +2506,7 @@ impl eframe::App for App {
                 });
         }
         self.member_card(ctx);
+        self.image_preview(ctx);
     }
 }
 fn key_string(key: &[u8]) -> String {
@@ -2099,7 +2583,7 @@ fn show_image(
     store: &Store,
     textures: &mut std::collections::BTreeMap<uuid::Uuid, egui::TextureHandle>,
     id: uuid::Uuid,
-) -> bool {
+) -> Option<egui::Response> {
     if !textures.contains_key(&id) {
         if textures.len() >= 32 {
             textures.clear();
@@ -2110,15 +2594,32 @@ fn show_image(
             }
         }
     }
-    if let Some(image) = textures.get(&id) {
-        let source = image.size_vec2();
-        let max = egui::vec2(ui.available_width().min(420.0), 300.0);
-        let scale = (max.x / source.x).min(max.y / source.y).min(1.0);
-        ui.add(egui::Image::new((image.id(), source * scale)).corner_radius(8));
-        true
-    } else {
-        false
+    let image = textures.get(&id)?;
+    let source = image.size_vec2();
+    let max = egui::vec2(ui.available_width().min(420.0), 300.0);
+    let scale = (max.x / source.x).min(max.y / source.y).min(1.0);
+    Some(
+        ui.add(
+            egui::Image::new((image.id(), source * scale))
+                .corner_radius(8)
+                .sense(Sense::click()),
+        )
+        .on_hover_cursor(egui::CursorIcon::ZoomIn),
+    )
+}
+
+fn save_attachment(store: &Store, id: uuid::Uuid) -> anyhow::Result<()> {
+    let bytes = store
+        .load::<Vec<u8>>(&format!("image-{id}"))?
+        .ok_or_else(|| anyhow::anyhow!("Изображение не найдено"))?;
+    if let Some(path) = rfd::FileDialog::new()
+        .set_file_name(format!("thodtalk-{id}.jpg"))
+        .add_filter("JPEG", &["jpg", "jpeg"])
+        .save_file()
+    {
+        std::fs::write(path, bytes)?;
     }
+    Ok(())
 }
 
 fn device_combo(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[String]) {

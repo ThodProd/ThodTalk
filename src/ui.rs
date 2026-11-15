@@ -204,6 +204,7 @@ pub enum Icon {
     Headphones,
     Gear,
     Plus,
+    Minus,
     Close,
     Send,
     Hash,
@@ -308,6 +309,9 @@ pub fn paint_icon(p: &egui::Painter, icon: Icon, rect: Rect, color: Color32, sla
         }
         Icon::Plus => {
             seg((12.0, 4.5), (12.0, 19.5));
+            seg((4.5, 12.0), (19.5, 12.0));
+        }
+        Icon::Minus => {
             seg((4.5, 12.0), (19.5, 12.0));
         }
         Icon::Close => {
@@ -505,6 +509,90 @@ pub fn icon_btn_sized(
         Rect::from_center_size(rect.center(), Vec2::splat(size * 0.62)),
         color,
         slashed,
+    );
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// Кнопка панели сообщения высотой 40 px: иконка всегда по центру поля.
+pub fn composer_btn(ui: &mut Ui, light: bool, icon: Icon, tone: Tone, enabled: bool) -> Response {
+    let enabled = enabled && ui.is_enabled();
+    let (rect, resp) = ui.allocate_exact_size(
+        vec2(32.0, 40.0),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let hovered = enabled && resp.hovered();
+    if hovered {
+        ui.painter().rect_filled(
+            Rect::from_center_size(rect.center(), Vec2::splat(28.0)),
+            CornerRadius::same(6),
+            hover(light),
+        );
+    }
+    let color = match tone {
+        Tone::Normal => {
+            if hovered {
+                text(light)
+            } else {
+                muted(light)
+            }
+        }
+        Tone::Active => accent(light),
+        Tone::Danger => {
+            if hovered {
+                danger(light)
+            } else {
+                muted(light)
+            }
+        }
+        Tone::Alert => danger(light),
+    };
+    paint_icon(
+        ui.painter(),
+        icon,
+        Rect::from_center_size(rect.center(), Vec2::splat(20.0)),
+        color,
+        false,
+    );
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        resp
+    }
+}
+
+/// Стрелка отправки без фона. Высота та же, что у поля ввода.
+pub fn composer_send(ui: &mut Ui, light: bool, enabled: bool) -> Response {
+    let enabled = enabled && ui.is_enabled();
+    let (rect, resp) = ui.allocate_exact_size(
+        vec2(34.0, 40.0),
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let hovered = enabled && resp.hovered();
+    let color = if !enabled {
+        muted(light).gamma_multiply(0.6)
+    } else if hovered {
+        accent(light).gamma_multiply(0.85)
+    } else {
+        accent(light)
+    };
+    paint_icon(
+        ui.painter(),
+        Icon::Send,
+        Rect::from_center_size(rect.center(), Vec2::splat(20.0)),
+        color,
+        false,
     );
     if enabled {
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)

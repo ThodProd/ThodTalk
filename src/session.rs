@@ -73,6 +73,16 @@ pub enum Payload {
         #[serde(with = "crate::wire::binary")]
         data: Vec<u8>,
     },
+    /// Announced when someone starts or stops sharing a screen in a voice channel.
+    ScreenState {
+        channel: Option<String>,
+    },
+    /// Sent by a viewer to the owner of the stream they joined or left.
+    ScreenWatch {
+        target: Vec<u8>,
+        channel: String,
+        watching: bool,
+    },
     FileStart {
         id: uuid::Uuid,
         channel: String,
@@ -95,6 +105,9 @@ pub struct Member {
     pub muted: bool,
     #[serde(default)]
     pub deafened: bool,
+    /// Voice channel in which this member is currently sharing their screen.
+    #[serde(default)]
+    pub screen: Option<String>,
 }
 const FILE_CHUNK: usize = 150 * 1024;
 struct PendingFile {
@@ -135,7 +148,10 @@ pub struct Session {
     pub voice_in: Vec<(Vec<u8>, String, Vec<u8>)>,
     /// Latest screen frame: author, channel, width, height, JPEG bytes.
     pub screen_in: Option<(Vec<u8>, String, u32, u32, Vec<u8>)>,
+    /// Viewer join/leave notices addressed to this client's own stream.
+    pub screen_watch_in: Vec<(Vec<u8>, String, bool)>,
     screen_rate: BTreeMap<Vec<u8>, std::time::Instant>,
+    last_screen_announce: std::time::Instant,
     file_out: Option<PendingFile>,
     file_queue: std::collections::VecDeque<PendingFile>,
     files_in: BTreeMap<uuid::Uuid, IncomingFile>,
@@ -190,7 +206,9 @@ impl Session {
             profile,
             voice_in: Vec::new(),
             screen_in: None,
+            screen_watch_in: Vec::new(),
             screen_rate: BTreeMap::new(),
+            last_screen_announce: std::time::Instant::now(),
             file_out: None,
             file_queue: std::collections::VecDeque::new(),
             files_in: BTreeMap::new(),
@@ -241,7 +259,9 @@ impl Session {
             profile,
             voice_in: Vec::new(),
             screen_in: None,
+            screen_watch_in: Vec::new(),
             screen_rate: BTreeMap::new(),
+            last_screen_announce: std::time::Instant::now(),
             file_out: None,
             file_queue: std::collections::VecDeque::new(),
             files_in: BTreeMap::new(),
@@ -292,7 +312,12 @@ impl Session {
         ensure!(self.hosting(), "Только хозяин может выключить сервер");
         self.set_closed(true);
         // Send goodbye message to all members
-        let keys_to_kick: Vec<_> = self.members.keys().filter(|k| *k != &self.owner).cloned().collect();
+        let keys_to_kick: Vec<_> = self
+            .members
+            .keys()
+            .filter(|k| *k != &self.owner)
+            .cloned()
+            .collect();
         for key in keys_to_kick {
             let _ = self.kick(&key);
         }
@@ -353,6 +378,7 @@ impl Session {
             voice: None,
             muted: false,
             deafened: false,
+            screen: None,
         });
         member.name = self.profile.name.clone();
         member.avatar = self.profile.avatar.clone();
@@ -468,6 +494,22 @@ impl Session {
             height,
             data,
         })
+    }
+    /// Announce that the local user started or stopped sharing. This is what
+    /// makes the stream clickable for everyone else in the voice channel.
+    pub fn set_screen(&mut self, channel: Option<&str>) -> Result<()> {
+        if let Some(channel) = channel {
+            ensure!(valid_channel(channel), "Неизвестный голосовой канал");
+        }
+        let own = self.own_key();
+        if let Some(member) = self.members.get_mut(&own) {
+            member.screen = channel.map(str::to_string);
+        }
+        self.send(Payload::ScreenState {
+            channel: channel.map(str::to_string),
+        })?;
+        self.last_screen_announce = std::time::Instant::now();
+        Ok(())
     }
     /// Share a file of any extension. Chunks are streamed by `pump_file` so a
     /// large transfer never blocks the network loop or voice packets.
@@ -817,6 +859,7 @@ impl Session {
                                 voice: None,
                                 muted: false,
                                 deafened: false,
+                                screen: None,
                             });
                             entry.name = name;
                             entry.avatar = avatar;
@@ -876,8 +919,7 @@ impl Session {
                             if target.author_key != author && author != self.owner {
                                 continue;
                             }
-                            let has_attachment =
-                                target.image.is_some() || target.file.is_some();
+                            let has_attachment = target.image.is_some() || target.file.is_some();
                             self.history.remove(&self.store, id)?;
                             if has_attachment {
                                 let _ = crate::attachments::remove(&self.store, id);
@@ -940,8 +982,50 @@ impl Session {
                             }) {
                                 continue;
                             }
-                            self.screen_rate.insert(author.clone(), std::time::Instant::now());
+                            self.screen_rate
+                                .insert(author.clone(), std::time::Instant::now());
                             self.screen_in = Some((author, channel, width, height, data));
+                        }
+                        Payload::ScreenState { channel } => {
+                            if channel
+                                .as_deref()
+                                .is_some_and(|channel| !valid_channel(channel))
+                            {
+                                continue;
+                            }
+                            if let Some(member) = self.members.get_mut(&author) {
+                                member.screen = channel.clone();
+                            }
+                            if channel.is_none()
+                                && self
+                                    .screen_in
+                                    .as_ref()
+                                    .is_some_and(|(frame_author, ..)| frame_author == &author)
+                            {
+                                self.screen_in = None;
+                            }
+                        }
+                        Payload::ScreenWatch {
+                            target,
+                            channel,
+                            watching,
+                        } => {
+                            if target != self.own_key()
+                                || author == target
+                                || !valid_channel(&channel)
+                            {
+                                continue;
+                            }
+                            let own = self.own_key();
+                            let sharing = self
+                                .members
+                                .get(&own)
+                                .and_then(|member| member.screen.as_deref())
+                                == Some(channel.as_str());
+                            if !sharing || self.screen_watch_in.len() >= 64 {
+                                continue;
+                            }
+                            self.screen_watch_in.push((author, channel, watching));
                         }
                         Payload::FileStart {
                             id,
@@ -994,7 +1078,8 @@ impl Session {
                                 continue;
                             }
                             let file = self.files_in.remove(&id).unwrap();
-                            if crate::attachments::save_bytes(&self.store, id, &file.data).is_err() {
+                            if crate::attachments::save_bytes(&self.store, id, &file.data).is_err()
+                            {
                                 continue;
                             }
                             let _ = self.history.append(
@@ -1045,6 +1130,21 @@ impl Session {
             self.last_file_sweep = std::time::Instant::now();
             self.files_in
                 .retain(|_, file| file.last.elapsed() < std::time::Duration::from_secs(120));
+        }
+        // Re-announce the active stream periodically so people who join later
+        // also see the clickable stream card.
+        if self.last_screen_announce.elapsed() > std::time::Duration::from_secs(2) {
+            let own = self.own_key();
+            if let Some(channel) = self
+                .members
+                .get(&own)
+                .and_then(|member| member.screen.clone())
+            {
+                let _ = self.send(Payload::ScreenState {
+                    channel: Some(channel),
+                });
+                self.last_screen_announce = std::time::Instant::now();
+            }
         }
         self.pump_file();
         Ok(())
@@ -1166,6 +1266,36 @@ mod tests {
         });
 
         let frame = vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4];
+        host.set_screen(Some("Общий")).unwrap();
+        pump(&mut host, &mut guests, |h, gs| {
+            gs[0]
+                .members
+                .get(&h.own_key())
+                .is_some_and(|member| member.screen.as_deref() == Some("Общий"))
+        });
+        let host_key = host.own_key();
+        let guest_key = guests[0].own_key();
+        guests[0]
+            .send(Payload::ScreenWatch {
+                target: host_key.clone(),
+                channel: "Общий".into(),
+                watching: true,
+            })
+            .unwrap();
+        pump(&mut host, &mut guests, |h, _| {
+            h.screen_watch_in.iter().any(|(viewer, channel, watching)| {
+                viewer == &guest_key && channel == "Общий" && *watching
+            })
+        });
+        assert!(
+            host.screen_watch_in
+                .iter()
+                .any(|(_, channel, watching)| { channel == "Общий" && *watching })
+        );
+        host.set_screen(None).unwrap();
+        pump(&mut host, &mut guests, |_, gs| {
+            gs[0].members.values().all(|member| member.screen.is_none())
+        });
         host.screen("Общий", 320, 180, frame.clone()).unwrap();
         pump(&mut host, &mut guests, |_, gs| gs[0].screen_in.is_some());
         let (author, channel, width, height, data) = guests[0].screen_in.clone().unwrap();

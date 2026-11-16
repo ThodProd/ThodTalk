@@ -56,6 +56,9 @@ enum Request {
         #[serde(with = "crate::wire::binary")]
         data: Vec<u8>,
     },
+    ScreenState {
+        channel: Option<String>,
+    },
     Kick(Vec<u8>),
     Ban(Vec<u8>),
     Closed(bool),
@@ -72,6 +75,7 @@ enum Event {
         #[serde(with = "crate::wire::binary")]
         data: Vec<u8>,
     },
+    ScreenWatch(Vec<(Vec<u8>, String, bool)>),
     Error(String),
     Fatal(String),
 }
@@ -106,6 +110,7 @@ pub struct SessionProxy {
     pub invite: Option<()>,
     pub voice_in: Vec<(Vec<u8>, String, Vec<u8>)>,
     pub screen_in: Option<(Vec<u8>, String, u32, u32, Vec<u8>)>,
+    pub screen_watch_in: Vec<(Vec<u8>, String, bool)>,
 }
 fn read<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> Result<T> {
     let mut line = Vec::new();
@@ -216,6 +221,7 @@ impl SessionProxy {
             invite: None,
             voice_in: Vec::new(),
             screen_in: None,
+            screen_watch_in: Vec::new(),
         };
         result.request(Request::Start {
             hosting,
@@ -275,6 +281,9 @@ impl SessionProxy {
                 data,
             } => {
                 self.screen_in = Some((author, channel, width, height, data));
+            }
+            Event::ScreenWatch(watches) => {
+                self.screen_watch_in.extend(watches);
             }
             Event::Error(error) => self.status = error,
             Event::Fatal(error) => anyhow::bail!("{error}"),
@@ -344,6 +353,11 @@ impl SessionProxy {
             width,
             height,
             data,
+        })
+    }
+    pub fn set_screen(&mut self, channel: Option<&str>) -> Result<()> {
+        self.request(Request::ScreenState {
+            channel: channel.map(str::to_string),
         })
     }
     pub fn edit_chat(&mut self, id: uuid::Uuid, text: &str) -> Result<()> {
@@ -476,6 +490,7 @@ pub fn run() -> Result<()> {
                     height,
                     data,
                 } => session.screen(&channel, width, height, data),
+                Request::ScreenState { channel } => session.set_screen(channel.as_deref()),
                 Request::Kick(key) => session.kick(&key),
                 Request::Ban(key) => session.ban(&key),
                 Request::Closed(value) => {
@@ -495,6 +510,12 @@ pub fn run() -> Result<()> {
         if !session.voice_in.is_empty() {
             write(
                 &Event::Voice(std::mem::take(&mut session.voice_in)),
+                &mut output,
+            )?;
+        }
+        if !session.screen_watch_in.is_empty() {
+            write(
+                &Event::ScreenWatch(std::mem::take(&mut session.screen_watch_in)),
                 &mut output,
             )?;
         }

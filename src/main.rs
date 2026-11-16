@@ -78,8 +78,12 @@ struct App {
     last_hosting: bool,
     share: Option<thodtalk::share::ScreenShare>,
     share_info: Option<thodtalk::share::SourceInfo>,
+    share_hud_user_moved: bool,
+    share_hud_seq: u64,
     screen: Option<ScreenView>,
     screen_visible: bool,
+    screen_watch: Option<(Vec<u8>, String)>,
+    stream_viewers: std::collections::BTreeSet<Vec<u8>>,
     share_picker: bool,
     share_sources: Vec<thodtalk::share::SourceInfo>,
     share_source: usize,
@@ -161,8 +165,12 @@ impl App {
             last_hosting: false,
             share: None,
             share_info: None,
+            share_hud_user_moved: false,
+            share_hud_seq: 0,
             screen: None,
             screen_visible: true,
+            screen_watch: None,
+            stream_viewers: std::collections::BTreeSet::new(),
             share_picker: false,
             share_sources: Vec::new(),
             share_source: 0,
@@ -247,6 +255,7 @@ impl App {
         self.audio.take();
         self.voice_channel = None;
         self.stop_share();
+        self.stop_watching_screen(false);
         self.screen = None;
         self.screen_visible = true;
         self.share_picker = false;
@@ -309,17 +318,82 @@ impl App {
             self.error = "Не выбран источник демонстрации".into();
             return;
         };
+        if self.voice_channel.is_none() || !self.session.as_ref().is_some_and(|s| s.ready()) {
+            self.error = "Сначала войдите в голосовой канал".into();
+            return;
+        }
+        self.stop_watching_screen(false);
         self.share = Some(thodtalk::share::ScreenShare::start(info.source));
         self.share_info = Some(info);
+        self.share_hud_user_moved = false;
+        self.share_hud_seq = self.share_hud_seq.wrapping_add(1);
         self.share_picker = false;
         self.screen_visible = true;
+        self.stream_viewers.clear();
+        if let (Some(session), Some(channel)) = (&mut self.session, &self.voice_channel) {
+            if let Err(error) = session.set_screen(Some(channel)) {
+                self.error = error.to_string();
+            }
+        }
         self.sound(thodtalk::sounds::Sound::ScreenShareStart);
     }
     fn stop_share(&mut self) {
         let was_sharing = self.share.take().is_some();
         self.share_info = None;
+        self.share_hud_user_moved = false;
         if was_sharing {
+            self.stream_viewers.clear();
+            if let Some(session) = &mut self.session {
+                let _ = session.set_screen(None);
+            }
             self.sound(thodtalk::sounds::Sound::ScreenShareStop);
+        }
+    }
+    /// Join somebody else's stream. The owner gets a soft join cue and starts
+    /// counting this client as a viewer.
+    fn watch_screen(&mut self, author: Vec<u8>, channel: String) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.own_key() == author)
+        {
+            return;
+        }
+        if self.screen_watch.as_ref() == Some(&(author.clone(), channel.clone())) {
+            self.screen_visible = true;
+            return;
+        }
+        self.stop_watching_screen(false);
+        self.screen_watch = Some((author.clone(), channel.clone()));
+        self.screen = None;
+        self.screen_visible = true;
+        if let Some(session) = &mut self.session {
+            let _ = session.send(Payload::ScreenWatch {
+                target: author,
+                channel,
+                watching: true,
+            });
+        }
+        self.sound(thodtalk::sounds::Sound::ScreenViewerJoin);
+    }
+    /// Leave the stream. `cue` is false when leaving voice also closes the
+    /// viewer, so we don't stack two sounds on one action.
+    fn stop_watching_screen(&mut self, cue: bool) {
+        let Some((author, channel)) = self.screen_watch.take() else {
+            self.screen_visible = false;
+            return;
+        };
+        if let Some(session) = &mut self.session {
+            let _ = session.send(Payload::ScreenWatch {
+                target: author,
+                channel,
+                watching: false,
+            });
+        }
+        self.screen = None;
+        self.screen_visible = false;
+        if cue {
+            self.sound(thodtalk::sounds::Sound::ScreenViewerLeave);
         }
     }
     /// Files dropped anywhere on the window are sent to the open text channel.
@@ -406,15 +480,15 @@ impl App {
             self.stop_share();
         }
 
-        // Incoming: keep only a frame for the voice channel we are in.
+        // Incoming: only decode frames from the stream this client explicitly joined.
         let frame = self.session.as_mut().and_then(|s| s.screen_in.take());
         let Some((author, channel, _width, _height, data)) = frame else {
             return;
         };
-        let own_key = self.session.as_ref().map(|s| s.own_key());
-        if self.voice_channel.as_deref() != Some(channel.as_str())
-            || own_key.as_deref() == Some(author.as_slice())
-        {
+        let Some((watch_author, watch_channel)) = self.screen_watch.clone() else {
+            return;
+        };
+        if watch_author != author || watch_channel != channel {
             return;
         }
         let Some(color) = screen_image(&data) else {
@@ -424,7 +498,6 @@ impl App {
             .screen
             .as_ref()
             .is_some_and(|view| view.author != author);
-        let fresh = self.screen.is_none();
         match &mut self.screen {
             Some(view) => {
                 view.texture.set(color, egui::TextureOptions::LINEAR);
@@ -440,7 +513,7 @@ impl App {
                 });
             }
         }
-        if switched || fresh {
+        if switched {
             self.screen_visible = true;
         }
     }
@@ -519,6 +592,7 @@ impl App {
             }
         }
         let mut disconnected = false;
+        let mut watch_events = Vec::new();
         if let Some(session) = &mut self.session {
             let old_message = session.history.messages.last().map(|m| m.id);
             let old_voices: std::collections::BTreeMap<_, _> = session
@@ -533,6 +607,7 @@ impl App {
                 }
                 disconnected = true;
             }
+            watch_events = std::mem::take(&mut session.screen_watch_in);
             if self.profile.sounds && !self.deafened {
                 if session
                     .history
@@ -612,10 +687,54 @@ impl App {
                 session.voice_in.clear();
             }
         }
+        for (viewer, channel, watching) in watch_events {
+            if self.share.is_none() || self.voice_channel.as_deref() != Some(channel.as_str()) {
+                continue;
+            }
+            if watching {
+                self.stream_viewers.insert(viewer);
+                self.sound(thodtalk::sounds::Sound::ScreenViewerJoin);
+            } else {
+                self.stream_viewers.remove(&viewer);
+                self.sound(thodtalk::sounds::Sound::ScreenViewerLeave);
+            }
+        }
+        if self.share.is_some() {
+            let gone: Vec<_> = self
+                .stream_viewers
+                .iter()
+                .filter(|viewer| {
+                    !self
+                        .session
+                        .as_ref()
+                        .is_some_and(|session| session.members.contains_key(*viewer))
+                })
+                .cloned()
+                .collect();
+            for viewer in gone {
+                self.stream_viewers.remove(&viewer);
+                self.sound(thodtalk::sounds::Sound::ScreenViewerLeave);
+            }
+        }
+        if !disconnected {
+            if let Some((author, channel)) = self.screen_watch.clone() {
+                let active = self.session.as_ref().is_some_and(|session| {
+                    session
+                        .members
+                        .get(&author)
+                        .is_some_and(|member| member.screen.as_deref() == Some(channel.as_str()))
+                });
+                if !active {
+                    self.stop_watching_screen(true);
+                }
+            }
+        }
         if disconnected {
             self.audio.take();
             self.voice_channel = None;
             self.stop_share();
+            self.screen_watch = None;
+            self.stream_viewers.clear();
             self.screen = None;
             self.session.take();
         }
@@ -626,6 +745,8 @@ impl App {
     }
     fn disconnect(&mut self) {
         self.stop_voice();
+        self.screen_watch = None;
+        self.stream_viewers.clear();
         self.session.take();
         self.member_textures.clear();
         self.speaking.clear();
@@ -987,25 +1108,28 @@ impl App {
                 {
                     toggle_share = true;
                 }
-                let available = self
-                    .screen
-                    .as_ref()
-                    .is_some_and(|view| view.updated.elapsed() < Duration::from_secs(3));
-                if available
+                let watching = self.screen_watch.is_some();
+                let stream_here = self.session.as_ref().is_some_and(|session| {
+                    let own = session.own_key();
+                    session.members.iter().any(|(key, member)| {
+                        key != &own && member.screen.as_deref() == Some(channel.as_str())
+                    })
+                });
+                if (watching || stream_here)
                     && !sharing
                     && ui::icon_btn(
                         ui,
                         light,
                         ui::Icon::Eye,
-                        if self.screen_visible {
+                        if watching {
                             ui::Tone::Active
                         } else {
                             ui::Tone::Normal
                         },
                         false,
                     )
-                    .on_hover_text(if self.screen_visible {
-                        "Скрыть демонстрацию экрана"
+                    .on_hover_text(if watching {
+                        "Отключиться от демонстрации"
                     } else {
                         "Смотреть демонстрацию экрана"
                     })
@@ -1028,7 +1152,23 @@ impl App {
                 self.toggle_share();
             }
             if toggle_watch {
-                self.screen_visible = !self.screen_visible;
+                if self.screen_watch.is_some() {
+                    self.stop_watching_screen(true);
+                } else if let Some((author, channel)) =
+                    self.voice_channel.as_ref().and_then(|channel| {
+                        let session = self.session.as_ref()?;
+                        let own = session.own_key();
+                        session
+                            .members
+                            .iter()
+                            .find(|(key, member)| {
+                                *key != &own && member.screen.as_deref() == Some(channel.as_str())
+                            })
+                            .map(|(key, _)| (key.clone(), channel.clone()))
+                    })
+                {
+                    self.watch_screen(author, channel);
+                }
             }
         }
 
@@ -1339,6 +1479,106 @@ impl App {
                     }
                 }
             });
+        }
+        if let Some(channel) = channel {
+            self.stream_cards(ui, channel);
+        }
+    }
+
+    /// Clickable card shown under a voice channel while somebody is sharing.
+    fn stream_cards(&mut self, ui: &mut egui::Ui, channel: &str) {
+        let light = self.profile.light_theme;
+        let Some(session) = &self.session else {
+            return;
+        };
+        let own = session.own_key();
+        let streams: Vec<(Vec<u8>, String)> = session
+            .members
+            .iter()
+            .filter(|(_, member)| member.screen.as_deref() == Some(channel))
+            .map(|(key, member)| (key.clone(), member.name.clone()))
+            .collect();
+        if streams.is_empty() {
+            return;
+        }
+        let watching = self.screen_watch.clone();
+        let viewers = self.stream_viewers.len();
+        let mut action = None;
+        for (author, name) in streams {
+            let is_own = author == own;
+            let is_watching = watching.as_ref().is_some_and(|(key, watch_channel)| {
+                key == &author && watch_channel.as_str() == channel
+            });
+            let card = Frame::new()
+                .fill(ui::surface(light))
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    if is_watching {
+                        ui::success(light)
+                    } else {
+                        ui::line(light)
+                    },
+                ))
+                .corner_radius(8)
+                .inner_margin(Margin::symmetric(7, 4))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui::icon_label(ui, ui::Icon::Monitor, 12.0, ui::success(light));
+                        let label = if is_own {
+                            "Ваша трансляция".to_string()
+                        } else {
+                            name.clone()
+                        };
+                        ui.add(
+                            egui::Label::new(RichText::new(label).size(12.0).color(
+                                if is_watching {
+                                    ui::success(light)
+                                } else {
+                                    ui::muted(light)
+                                },
+                            ))
+                            .truncate(),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if is_own {
+                                ui.label(
+                                    RichText::new(format!("{viewers} смотрят"))
+                                        .size(10.5)
+                                        .color(ui::muted(light)),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new(if is_watching {
+                                        "Смотреть ✓"
+                                    } else {
+                                        "Смотреть"
+                                    })
+                                    .size(10.5)
+                                    .color(if is_watching {
+                                        ui::success(light)
+                                    } else {
+                                        ui::muted(light)
+                                    }),
+                                );
+                            }
+                        });
+                    });
+                });
+            if !is_own {
+                let response = card.response.interact(Sense::click());
+                let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                if response.clicked() {
+                    action = Some((author, is_watching));
+                }
+            }
+        }
+        if let Some((author, is_watching)) = action {
+            if is_watching {
+                self.stop_watching_screen(true);
+            } else {
+                self.watch_screen(author, channel.to_string());
+            }
         }
     }
 
@@ -1928,117 +2168,154 @@ impl App {
             self.share_info = None;
             return;
         }
-        let orange = egui::Color32::from_rgb(242, 140, 54);
-        let background = egui::Color32::from_rgb(23, 22, 21);
+        // Smoky glass: translucent dark fill, light hairline rim and a soft
+        // top highlight. The native viewport is transparent outside the pill.
+        let background = egui::Color32::from_rgba_unmultiplied(34, 34, 42, 150);
+        let border = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28);
         let ((monitor_x, monitor_y, monitor_w, monitor_h), monitor_scale) =
             thodtalk::share::hud_geometry(info.source).unwrap_or(((0, 0, 1280, 720), 1.0));
         let points_per_pixel = (monitor_scale * ctx.zoom_factor()).max(0.5);
-        let width = 392.0;
-        let height = 72.0;
-        let margin = 40.0;
-        let position = egui::pos2(
+        let width = 252.0;
+        let height = 38.0;
+        let margin = 28.0;
+        let default_position = egui::pos2(
             monitor_x as f32 / points_per_pixel + monitor_w as f32 / points_per_pixel / 2.0
                 - width / 2.0,
             (monitor_y + monitor_h) as f32 / points_per_pixel - height - margin,
         );
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(SHARE_HUD_TITLE)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_active(false)
+            .with_close_button(false)
+            .with_always_on_top()
+            .with_transparent(true)
+            .with_inner_size([width, height]);
+        if !self.share_hud_user_moved {
+            builder = builder.with_position(default_position);
+        }
         let mut stop = false;
+        let mut user_moved = self.share_hud_user_moved;
         let title = info.title.clone();
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("thodtalk-share-hud"),
-            egui::ViewportBuilder::default()
-                .with_title(SHARE_HUD_TITLE)
-                .with_decorations(false)
-                .with_resizable(false)
-                .with_taskbar(false)
-                .with_active(false)
-                .with_close_button(false)
-                .with_always_on_top()
-                .with_position(position)
-                .with_inner_size([width, height]),
-            |ctx, _class| {
-                if ctx.input(|input| input.viewport().close_requested()) {
-                    stop = true;
-                }
-                egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::new()
-                            .fill(background)
-                            .stroke(egui::Stroke::new(2.0_f32, orange))
-                            .corner_radius(10)
-                            .inner_margin(egui::Margin::symmetric(14, 10)),
-                    )
-                    .show(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 10.0;
-                            let (icon_rect, _) =
-                                ui.allocate_exact_size(Vec2::splat(38.0), Sense::hover());
-                            ui.painter().circle_filled(
-                                icon_rect.center(),
-                                19.0,
-                                egui::Color32::from_rgba_unmultiplied(242, 140, 54, 38),
-                            );
-                            ui::paint_icon(
-                                ui.painter(),
-                                ui::Icon::Monitor,
-                                icon_rect.shrink(10.0),
-                                orange,
-                                false,
-                            );
-                            ui.vertical(|ui| {
-                                ui.set_max_width(190.0);
-                                ui.spacing_mut().item_spacing.y = 2.0;
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                    let time = ctx.input(|input| input.time) as f32;
-                                    let pulse = 0.55 + 0.45 * (time * 3.0).sin().abs();
-                                    let (dot, _) =
-                                        ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
-                                    ui.painter().circle_filled(
-                                        dot.center(),
-                                        4.0,
-                                        orange.gamma_multiply(pulse),
-                                    );
-                                    ui.label(
-                                        RichText::new("Идёт демонстрация")
-                                            .size(13.5)
-                                            .strong()
-                                            .color(egui::Color32::WHITE),
-                                    );
-                                });
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&title)
-                                            .size(11.5)
-                                            .color(egui::Color32::from_rgb(188, 181, 174)),
-                                    )
-                                    .truncate(),
-                                )
-                                .on_hover_text(&title);
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let button = egui::Button::new(
-                                    RichText::new("Завершить")
-                                        .size(13.0)
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
-                                )
-                                .fill(orange)
-                                .stroke(egui::Stroke::NONE)
-                                .corner_radius(9)
-                                .min_size(egui::vec2(96.0, 34.0));
-                                if ui
-                                    .add(button)
-                                    .on_hover_text("Остановить демонстрацию экрана")
-                                    .clicked()
-                                {
-                                    stop = true;
-                                }
-                            });
-                        });
-                    });
-            },
-        );
-        #[cfg(windows)]
+        let viewport_id = egui::ViewportId::from_hash_of((
+            "thodtalk-share-hud",
+            std::process::id(),
+            self.share_hud_seq,
+        ));
+        ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
+            if ctx.input(|input| input.viewport().close_requested()) {
+                stop = true;
+            }
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(background)
+                        .stroke(egui::Stroke::new(1.0_f32, border))
+                        .corner_radius(19)
+                        .inner_margin(egui::Margin::symmetric(10, 6)),
+                )
+                .show(ctx, |ui| {
+                    let rect = ui.max_rect();
+                    // One interaction for the whole pill: dragging anywhere
+                    // moves the window, clicking the phone icon stops sharing.
+                    let hit = ui.interact(
+                        rect,
+                        egui::Id::new("share-hud-hit"),
+                        Sense::click_and_drag(),
+                    );
+                    let painter = ui.painter();
+                    let center_y = rect.center().y;
+                    let time = ctx.input(|input| input.time) as f32;
+                    let pulse = 0.55 + 0.45 * (time * 2.6).sin().abs();
+                    painter.circle_filled(
+                        egui::pos2(rect.left() + 3.5, center_y),
+                        3.5,
+                        egui::Color32::from_rgba_unmultiplied(
+                            236,
+                            138,
+                            58,
+                            (150.0 + 105.0 * pulse) as u8,
+                        ),
+                    );
+                    let button_center = egui::pos2(rect.right() - 13.0, center_y);
+                    let button_rect =
+                        egui::Rect::from_center_size(button_center, Vec2::splat(26.0));
+                    let over_button = hit
+                        .hover_pos()
+                        .is_some_and(|position| button_rect.contains(position));
+                    let button_fill = if over_button {
+                        egui::Color32::from_rgba_unmultiplied(150, 60, 40, 235)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(98, 37, 28, 205)
+                    };
+                    painter.circle_filled(button_center, 13.0, button_fill);
+                    ui::paint_icon(
+                        painter,
+                        ui::Icon::HangUp,
+                        button_rect.shrink(7.0),
+                        egui::Color32::from_rgb(246, 234, 230),
+                        false,
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(rect.left() + 12.0, rect.top() + 0.5),
+                            egui::pos2(rect.right() - 12.0, rect.top() + 0.5),
+                        ],
+                        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(24)),
+                    );
+                    let text_left = rect.left() + 12.0;
+                    let text_right = button_center.x - 13.0 - 8.0;
+                    let max_width = (text_right - text_left).max(1.0);
+                    let mut text = egui::text::LayoutJob::default();
+                    text.wrap = egui::text::TextWrapping::truncate_at_width(max_width);
+                    text.append(
+                        "Идёт демонстрация",
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(11.0),
+                            color: egui::Color32::from_rgb(240, 238, 235),
+                            ..Default::default()
+                        },
+                    );
+                    text.append(
+                        &format!("  ·  {title}"),
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(10.5),
+                            color: egui::Color32::from_rgb(176, 172, 168),
+                            ..Default::default()
+                        },
+                    );
+                    let galley = ui.fonts(|fonts| fonts.layout_job(text));
+                    painter.galley(
+                        egui::pos2(text_left, center_y - galley.size().y / 2.0),
+                        galley,
+                        egui::Color32::WHITE,
+                    );
+                    if hit.clicked() {
+                        if let Some(position) = hit.interact_pointer_pos() {
+                            if button_rect.contains(position) {
+                                stop = true;
+                            }
+                        }
+                    }
+                    if hit.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        user_moved = true;
+                    }
+                    if over_button {
+                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                    } else if hit.dragged() {
+                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                    } else if hit.hovered() {
+                        ctx.set_cursor_icon(egui::CursorIcon::Grab);
+                    }
+                });
+        });
+        self.share_hud_user_moved = user_moved;
+        #[cfg(all(windows, not(debug_assertions)))]
         thodtalk::share::exclude_from_capture(SHARE_HUD_TITLE);
         if stop {
             self.stop_share();
@@ -2076,7 +2353,7 @@ impl App {
             .show(ctx, |ui| {
                 ui.add(egui::Image::new((texture.id(), source * scale)).corner_radius(8));
                 ui.horizontal(|ui| {
-                    if ui.button("Скрыть").clicked() {
+                    if ui.button("Отключиться").clicked() {
                         hide = true;
                     }
                     ui.label(
@@ -2087,7 +2364,7 @@ impl App {
                 });
             });
         if hide {
-            self.screen_visible = false;
+            self.stop_watching_screen(true);
         }
     }
 

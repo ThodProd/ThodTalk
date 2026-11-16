@@ -8,9 +8,10 @@ Copyright 2025 Sharkord Team) использован как функционал
 Транспорт и поиск узлов: iroh. Графика приложения создана для ThodTalk.
 Segoe UI загружается из установленной Windows и не распространяется в пакете.
 
-Звуки начала и конца демонстрации экрана: Interface Sounds 1.0, © Kenney
-(www.kenney.nl), лицензия CC0 1.0. Использованы confirmation_002.wav и
-close_002.wav; полный текст лицензии — assets/sounds/LICENSE.txt.
+Звуки демонстрации экрана и подключения/отключения зрителей:
+Interface Sounds 1.0, © Kenney (www.kenney.nl), лицензия CC0 1.0.
+Использованы confirmation_002.wav и close_002.wav; полный текст лицензии —
+assets/sounds/LICENSE.txt.
 
 Список версий и лицензий зависимостей включается при сборке в THIRD-PARTY.txt,
 тексты лицензий — в licenses/. Изменение сборки iroh описано в vendor/README.md.

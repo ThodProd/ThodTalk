@@ -110,7 +110,6 @@ impl App {
         };
         let storage_error = !error.is_empty();
         let (inputs, outputs) = thodtalk::audio::devices();
-        let last_server = profile.last_server_code.clone();
         let mut app = Self {
             store,
             profile,
@@ -182,12 +181,9 @@ impl App {
         app.ptt = app.profile.push_to_talk;
         app.profile.network_allowed = true;
         app.profile.microphone_allowed = true;
-        // Auto-connect to last server if available
-        if let Some(server_code) = last_server {
-            if !saved || app.error.is_empty() {
-                app.code = server_code;
-            }
-        }
+        // Keep the last code only for silent reconnect after a network drop.
+        // The invitation field must stay empty so users never mistake an old
+        // server code for a newly entered invitation.
         ui::theme(&cc.egui_ctx, app.profile.light_theme);
         app.update_avatar(&cc.egui_ctx);
         app

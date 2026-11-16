@@ -73,6 +73,8 @@ struct App {
     update_ready: Option<thodtalk::updater::Prepared>,
     update_status: String,
     update_started: bool,
+    network_log: Vec<String>,
+    show_network_log: bool,
     reconnect_attempts: u32,
     last_disconnect_time: Option<std::time::Instant>,
     last_hosting: bool,
@@ -159,6 +161,8 @@ impl App {
             update_ready: None,
             update_status: String::new(),
             update_started: false,
+            network_log: Vec::new(),
+            show_network_log: false,
             reconnect_attempts: 0,
             last_disconnect_time: None,
             last_hosting: false,
@@ -191,6 +195,19 @@ impl App {
     fn update_avatar(&mut self, ctx: &egui::Context) {
         self.avatar = texture(ctx, "avatar", &self.profile.avatar);
     }
+    fn network_log(&mut self, message: impl Into<String>) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() % 86_400)
+            .unwrap_or_default();
+        let h = stamp / 3600;
+        let m = (stamp / 60) % 60;
+        let s = stamp % 60;
+        self.network_log.push(format!("[{h:02}:{m:02}:{s:02}] {}", message.into()));
+        if self.network_log.len() > 500 {
+            self.network_log.drain(..self.network_log.len() - 500);
+        }
+    }
     fn connect(&mut self, hosting: bool) {
         if self.connecting.is_some() {
             return;
@@ -200,6 +217,11 @@ impl App {
         let code = self.code.clone();
 
         self.last_hosting = hosting;
+        self.network_log(if hosting {
+            "Запуск сервера: подготовка endpoint и relay".to_string()
+        } else {
+            format!("Подключение: отправка кода ({} символов)", code.trim().len())
+        });
         if !hosting {
             self.profile.last_server_code = Some(code.clone());
         }
@@ -578,18 +600,21 @@ impl App {
                 self.connecting = None;
                 match result {
                     Ok(session) => {
+                        self.network_log("Рукопожатие завершено, сессия открыта");
                         self.session = Some(session);
                         self.last_disconnect_time = None;
                         self.reconnect_attempts = 0;
                         self.code.clear();
                     }
                     Err(e) => {
+                        self.network_log(format!("Ошибка подключения: {e:#}"));
                         self.error = format!("Подключение не удалось: {e}");
                     }
                 }
             }
         }
         let mut disconnected = false;
+        let mut disconnect_log = None;
         let mut watch_events = Vec::new();
         if let Some(session) = &mut self.session {
             let old_message = session.history.messages.last().map(|m| m.id);
@@ -599,6 +624,7 @@ impl App {
                 .map(|(k, m)| (k.clone(), m.voice.clone()))
                 .collect();
             if let Err(e) = session.poll() {
+                disconnect_log = Some(format!("Соединение прервано: {e:#}"));
                 self.error = format!("Соединение прервано: {e}. История сохранена локально.");
                 if self.profile.sounds && !self.deafened {
                     thodtalk::sounds::play(thodtalk::sounds::Sound::Error);
@@ -684,6 +710,9 @@ impl App {
             } else {
                 session.voice_in.clear();
             }
+        }
+        if let Some(message) = disconnect_log {
+            self.network_log(message);
         }
         for (viewer, channel, watching) in watch_events {
             if self.share.is_none() || self.voice_channel.as_deref() != Some(channel.as_str()) {
@@ -3062,6 +3091,31 @@ impl App {
                             host = ui
                                 .add_enabled(enabled, ui::secondary("Запустить сервер"))
                                 .clicked();
+                        });
+                        ui.add_space(10.0);
+                        ui::card(ui, light, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(ui::heading("Диагностика подключения", 15.0));
+                                if ui.button(if self.show_network_log { "Скрыть" } else { "Показать" }).clicked() {
+                                    self.show_network_log = !self.show_network_log;
+                                }
+                                if ui.button("Копировать").clicked() {
+                                    ui.ctx().copy_text(self.network_log.join("\n"));
+                                }
+                                if ui.button("Очистить").clicked() {
+                                    self.network_log.clear();
+                                }
+                            });
+                            if self.show_network_log {
+                                let mut text = self.network_log.join("\n");
+                                if text.is_empty() { text = "Событий пока нет".into(); }
+                                ui.add_sized(
+                                    [ui.available_width(), 150.0],
+                                    egui::TextEdit::multiline(&mut text)
+                                        .font(egui::TextStyle::Monospace)
+                                        .interactive(false),
+                                );
+                            }
                         });
                     });
                 });

@@ -200,16 +200,13 @@ impl App {
             return;
         }
         let path = self.store.root.clone();
-        let mut profile = self.profile.clone();
+        let profile = self.profile.clone();
         let code = self.code.clone();
 
-        // Remember last server connection
-        if !hosting && !code.is_empty() {
-            profile.last_server_code = Some(code.clone());
-            let _ = self.store.save("profile", &profile);
-        }
-
         self.last_hosting = hosting;
+        if !hosting {
+            self.profile.last_server_code = Some(code.clone());
+        }
         let (tx, rx) = mpsc::sync_channel(1);
         self.connecting = Some(rx);
         self.error.clear();
@@ -562,14 +559,19 @@ impl App {
             }
         }
 
-        // Auto-reconnect after disconnection (up to 3 attempts over ~2 min)
+        // Auto-reconnect after disconnection (up to 3 attempts, 5s/10s/20s)
         if let Some(last_dc) = self.last_disconnect_time {
             if self.session.is_none() && self.connecting.is_none() && self.reconnect_attempts < 3 {
-                let wait_ms = 15_000 * (1 << self.reconnect_attempts); // 15s, 30s, 60s
+                ctx.request_repaint_after(Duration::from_millis(250));
+                let wait_ms = 5_000 * (1 << self.reconnect_attempts); // 5s, 10s, 20s
                 if last_dc.elapsed() > Duration::from_millis(wait_ms) {
                     self.reconnect_attempts += 1;
-                    if !self.code.is_empty() {
-                        self.connect(!self.last_hosting);
+                    if !self.last_hosting
+                        && self.profile.last_server_code.as_ref().is_some_and(|code| !code.is_empty())
+                    {
+                        self.code = self.profile.last_server_code.clone().unwrap_or_default();
+                        self.last_disconnect_time = Some(std::time::Instant::now());
+                        self.connect(false);
                     }
                 }
             }
@@ -730,6 +732,10 @@ impl App {
             }
         }
         if disconnected {
+            if !self.last_hosting {
+                self.last_disconnect_time = Some(std::time::Instant::now());
+                self.reconnect_attempts = 0;
+            }
             self.audio.take();
             self.voice_channel = None;
             self.stop_share();
@@ -752,7 +758,7 @@ impl App {
         self.speaking.clear();
         self.user_card = None;
         self.page = Page::Home;
-        self.last_disconnect_time = Some(std::time::Instant::now());
+        self.last_disconnect_time = None;
         self.reconnect_attempts = 0;
     }
     fn open_settings(&mut self) {
@@ -3019,24 +3025,7 @@ impl App {
                                     .color(ui::danger(light)),
                             );
                         }
-                        // Quick join last server
-                        if let Some(last_code) = self.profile.last_server_code.clone() {
-                            if !last_code.is_empty() {
-                                let code_to_join = last_code.clone();
-                                ui::card(ui, light, |ui| {
-                                    ui.label(ui::heading("Быстрое подключение", 17.0));
-                                    ui.label(
-                                        RichText::new("Переподключиться к последнему серверу")
-                                            .color(ui::muted(light)),
-                                    );
-                                    ui.add_space(6.0);
-                                    if ui.add_enabled(enabled, ui::primary("Присоединиться")).clicked() {
-                                        self.code = code_to_join;
-                                        self.connect(false);
-                                    }
-                                });
-                            }
-                        }
+                        // Removed quick join to last server (was causing confusion between host/guest)
                         ui::card(ui, light, |ui| {
                             ui.label(ui::heading("Войти по приглашению", 17.0));
                             ui.label(
@@ -3082,6 +3071,8 @@ impl App {
                 });
             });
         if cancel {
+            self.last_disconnect_time = None;
+            self.reconnect_attempts = 0;
             if let Some(cancel) = self.cancel_connect.take() {
                 cancel.store(true, Ordering::Relaxed);
             }

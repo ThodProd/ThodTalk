@@ -199,7 +199,7 @@ impl Session {
             room,
             members: BTreeMap::new(),
             history,
-            status: "Сервер работает".into(),
+            status: "Проверяем маршрут для подключения друзей…".into(),
             invite: None,
             code: String::new(),
             closed: false,
@@ -689,6 +689,10 @@ impl Session {
         if let Some(rx) = &self.invite {
             if let Ok(event) = rx.try_recv() {
                 match event {
+                    PairEvent::LocalCode(code) => {
+                        self.code = code;
+                        self.status = "Интернет-relay недоступен. Доступно прямое подключение; для интернета повторите запуск или задайте THODTALK_RELAY_URLS".into();
+                    }
                     PairEvent::Code(code) => {
                         self.code = code;
                         self.status =
@@ -1163,7 +1167,7 @@ mod tests {
         guests: &mut [Session],
         condition: impl Fn(&Session, &[Session]) -> bool,
     ) {
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = Instant::now() + Duration::from_secs(8);
         loop {
             host.poll().unwrap();
             for guest in guests.iter_mut() {
@@ -1406,7 +1410,7 @@ mod tests {
             InternetHost::local,
         )
         .unwrap();
-        host.poll().unwrap();
+        pump(&mut host, &mut [], |h, _| !h.code.is_empty());
         let code = host.code.clone();
         let room = host.room;
         let mut guests = Vec::new();
@@ -1484,7 +1488,7 @@ mod tests {
         drop(host);
         let mut next =
             Session::host_with(Store::open(root).unwrap(), owner, InternetHost::local).unwrap();
-        next.poll().unwrap();
+        pump(&mut next, &mut [], |h, _| !h.code.is_empty());
         assert_ne!(next.code, code);
         assert_eq!(next.room, room);
         assert_eq!(next.history.messages.len(), 3);

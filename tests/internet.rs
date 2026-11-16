@@ -22,7 +22,7 @@ fn shared_code_two_guests_chat_and_kick() {
         let file = std::fs::File::create(path).unwrap();
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
-                "iroh=debug,iroh::socket::transports::relay=trace,iroh_relay=trace,noq=debug",
+                "iroh=debug,iroh::socket::transports::relay=trace,iroh_relay=trace,noq=trace,noq_proto=trace",
             )
             .with_ansi(false)
             .with_writer(std::sync::Mutex::new(file))

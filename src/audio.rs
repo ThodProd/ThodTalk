@@ -64,9 +64,9 @@ impl Audio {
         let transmitting = Arc::new(AtomicBool::new(false));
         let deafened = Arc::new(AtomicBool::new(false));
         let queues: Arc<Mutex<BTreeMap<Vec<u8>, VecDeque<f32>>>> = Arc::default();
-        // Increased buffer sizes to reduce latency spikes and underruns
-        let (frames_tx, frames_rx) = mpsc::sync_channel::<Vec<i16>>(16);
-        let (encoded_tx, encoded) = mpsc::sync_channel(16);
+        // Each frame is 20 ms: do not retain hundreds of ms of stale speech.
+        let (frames_tx, frames_rx) = mpsc::sync_channel::<Vec<i16>>(3);
+        let (encoded_tx, encoded) = mpsc::sync_channel(3);
         let (errors_tx, errors) = mpsc::sync_channel(16);
         let error_in = errors_tx.clone();
         let error_out = errors_tx.clone();
@@ -187,7 +187,11 @@ impl Audio {
                     move |data: &mut [i16], _| {
                         let mut samples = vec![0.0; data.len()];
                         if let Ok(mut queues) = q_i16.try_lock() {
-                            if !silent_i16.load(Ordering::Relaxed) {
+                            if silent_i16.load(Ordering::Relaxed) {
+                                for queue in queues.values_mut() {
+                                    queue.clear();
+                                }
+                            } else {
                                 if let Ok(mut phase) = phase_i16.try_lock() {
                                     for sample_frame in samples.chunks_exact_mut(out_channels) {
                                         let mut mix = 0.0f32;
@@ -293,10 +297,10 @@ impl Audio {
         if let Ok(mut queues) = self.queues.lock() {
             let queue = queues.entry(author).or_default();
             if queue.is_empty() {
-                queue.extend(std::iter::repeat_n(0.0, 1920));
+                queue.extend(std::iter::repeat_n(0.0, 960));
             }
-            if queue.len() > 9600 {
-                queue.drain(..queue.len() - 4800);
+            if queue.len() + len > 4800 {
+                queue.drain(..queue.len().saturating_sub(1920));
             }
             queue.extend(
                 samples[..len]

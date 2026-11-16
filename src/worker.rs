@@ -228,7 +228,7 @@ impl SessionProxy {
             profile,
             code: code.into(),
         })?;
-        let deadline = Instant::now() + Duration::from_secs(75);
+        let deadline = Instant::now() + Duration::from_secs(40);
         loop {
             ensure!(!cancel.load(Ordering::Relaxed), "Подключение отменено");
             ensure!(Instant::now() < deadline, "Рабочий процесс не ответил");
@@ -255,6 +255,7 @@ impl SessionProxy {
     fn apply(&mut self, event: Event) -> Result<()> {
         match event {
             Event::State(s) => {
+                ensure!(s.hosting == self.hosting, "Сетевая сессия изменила роль подключения");
                 self.key = s.key;
                 self.hosting = s.hosting;
                 self.ready = s.ready;

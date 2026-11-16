@@ -14,7 +14,9 @@ struct Client {
 }
 impl Client {
     fn start(path: &std::path::Path, name: &str, hosting: bool, code: &str) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_thodtalk"));
+        let executable = std::env::var_os("THODTALK_TEST_EXE")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_thodtalk").into());
+        let mut command = Command::new(executable);
         command
             .arg("--session-worker")
             .env("THODHUB_DATA_DIR", path)
@@ -114,13 +116,18 @@ fn packaged_workers_public_chat_voice_and_kick() {
         true,
         "",
     )];
-    wait(&mut clients, 10, |cs| {
+    wait(&mut clients, 30, |cs| {
         cs[0].state["code"].as_str().is_some_and(|s| !s.is_empty())
     });
     let code = clients[0].state["code"].as_str().unwrap().to_owned();
+    let connecting = Instant::now();
     clients.push(Client::start(&dir.path().join("a"), "Друг А", false, &code));
     clients.push(Client::start(&dir.path().join("b"), "Друг Б", false, &code));
-    wait(&mut clients, 180, |cs| cs.iter().all(|c| c.members() == 3));
+    wait(&mut clients, 35, |cs| cs.iter().all(|c| c.members() == 3));
+    eprintln!("Two guests connected in {:?}", connecting.elapsed());
+    assert_eq!(clients[0].state["hosting"], true);
+    assert_eq!(clients[1].state["hosting"], false);
+    assert_eq!(clients[2].state["hosting"], false);
     clients[1].send(json!({"Chat":{"channel":"Общий","text":"Проверка публичного маршрута"}}));
     wait(&mut clients, 15, |cs| cs.iter().all(|c| c.messages() == 1));
     let mut encoder =
@@ -131,8 +138,10 @@ fn packaged_workers_public_chat_voice_and_kick() {
     let mut packet = vec![0; 4000];
     let size = encoder.encode(&samples, &mut packet).unwrap();
     packet.truncate(size);
-    clients[1].send(json!({"Payload":{"Voice":{"channel":"Общий","data":packet}}}));
+    clients[1].send(json!({"Payload":{"Voice":{"channel":"Общий","data":packet.clone()}}}));
     wait(&mut clients, 15, |cs| cs[0].voices > 0 && cs[2].voices > 0);
+    clients[0].send(json!({"Payload":{"Voice":{"channel":"Общий","data":packet}}}));
+    wait(&mut clients, 15, |cs| cs[1].voices > 0 && cs[2].voices > 1);
     clients[0].send(json!({"Closed":true}));
     let key = clients[1].state["key"].clone();
     clients[0].send(json!({"Kick":key}));

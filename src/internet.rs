@@ -32,6 +32,7 @@ pub struct Invitation {
 }
 pub enum PairEvent {
     Code(String),
+    LocalCode(String),
 }
 
 pub struct InternetHost {
@@ -52,17 +53,18 @@ fn runtime() -> Result<Arc<Runtime>> {
             .build()?,
     ))
 }
-fn internet_builder() -> iroh::endpoint::Builder {
-    let builder = Endpoint::builder(presets::N0).transport_config(
-        iroh::endpoint::QuicTransportConfig::builder()
-            .enable_segmentation_offload(false)
-            .build(),
-    );
+fn internet_builder() -> Result<iroh::endpoint::Builder> {
+    let builder = Endpoint::builder(presets::N0);
     let builder = if std::env::var_os("THODTALK_TEST_RELAY_ONLY").is_some() {
         builder.clear_ip_transports()
     } else {
         builder
     };
+    let relays = relay_candidates()?;
+    let relay_map = iroh::RelayMap::from_iter([relays[0].clone()]);
+    Ok(builder.relay_mode(iroh::RelayMode::Custom(relay_map)))
+}
+fn relay_candidates() -> Result<Vec<iroh::RelayUrl>> {
     if let Ok(region) = std::env::var("THODTALK_TEST_RELAY_REGION") {
         let name = match region.as_str() {
             "asia" => "aps1-1",
@@ -73,9 +75,23 @@ fn internet_builder() -> iroh::endpoint::Builder {
         let url: iroh::RelayUrl = format!("https://{name}.relay.n0.iroh.link./")
             .parse()
             .unwrap();
-        return builder.relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from_iter([url])));
+        return Ok(vec![url]);
     }
-    builder
+    // Probe actual application traffic before publishing a route: a fast HTTPS
+    // probe alone does not mean the relay can carry a conversation.
+    let urls = std::env::var("THODTALK_RELAY_URLS").unwrap_or_else(|_| {
+        "https://aps1-1.relay.n0.iroh.link./,https://usw1-1.relay.n0.iroh.link./,https://use1-1.relay.n0.iroh.link./,https://euc1-1.relay.n0.iroh.link./".into()
+    });
+    let relays = urls
+        .split(',')
+        .map(|url| {
+            url.trim()
+                .parse::<iroh::RelayUrl>()
+                .context("Некорректный адрес THODTALK_RELAY_URLS")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(!relays.is_empty(), "Не задан ни один relay");
+    Ok(relays)
 }
 impl InternetHost {
     #[cfg(test)]
@@ -97,7 +113,7 @@ impl InternetHost {
     pub fn start() -> Result<Self> {
         let relay = Relay::start("127.0.0.1:0".parse()?)?;
         let runtime = runtime()?;
-        let endpoint = runtime.block_on(internet_builder().alpns(vec![ALPN.to_vec()]).bind())?;
+        let endpoint = runtime.block_on(internet_builder()?.alpns(vec![ALPN.to_vec()]).bind())?;
         Self::start_with(relay, runtime, endpoint)
     }
     fn start_with(relay: Relay, runtime: Arc<Runtime>, endpoint: Endpoint) -> Result<Self> {
@@ -201,11 +217,93 @@ impl InternetHost {
             owner_key,
             room,
         });
-        let code = encode_code(self.endpoint.id(), &self.token);
         let (tx, rx) = mpsc::channel();
-        let _ = tx.send(PairEvent::Code(code));
+        let endpoint = self.endpoint.clone();
+        let token = self.token;
+        self.runtime.spawn(async move {
+            // Include the actual route so a freshly created server does not depend
+            // on DNS/PKARR publication having propagated before the first join.
+            let _ = tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await;
+            let candidates = relay_candidates().unwrap_or_default();
+            let mut verified = false;
+            for index in 0..candidates.len() {
+                let Some(relay) = endpoint.addr().relay_urls().next().cloned() else {
+                    break;
+                };
+                if relay_probe(&endpoint, relay.clone(), token).await {
+                    verified = true;
+                    break;
+                }
+                if let Some(next) = candidates.get(index + 1) {
+                    endpoint
+                        .insert_relay(
+                            next.clone(),
+                            Arc::new(iroh::RelayConfig::from(next.clone())),
+                        )
+                        .await;
+                }
+                endpoint.remove_relay(&relay).await;
+                let _ = tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        if endpoint.addr().relay_urls().any(|url| url != &relay) {
+                            endpoint.online().await;
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                })
+                .await;
+            }
+            let address = if verified {
+                endpoint.addr()
+            } else {
+                // Relay removal is asynchronous; never publish a stale failed route.
+                endpoint
+                    .addr()
+                    .ip_addrs()
+                    .fold(EndpointAddr::new(endpoint.id()), |addr, ip| {
+                        addr.with_ip_addr(*ip)
+                    })
+            };
+            let code = encode_address_code(&address, &token);
+            let event = if verified {
+                PairEvent::Code(code)
+            } else {
+                PairEvent::LocalCode(code)
+            };
+            let _ = tx.send(event);
+        });
         rx
     }
+}
+async fn relay_probe(host: &Endpoint, relay: iroh::RelayUrl, token: [u8; 16]) -> bool {
+    let Ok(probe) = Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .relay_mode(iroh::RelayMode::Custom(iroh::RelayMap::from_iter([
+            relay.clone()
+        ])))
+        .bind()
+        .await
+    else {
+        return false;
+    };
+    let result = tokio::time::timeout(Duration::from_secs(4), async {
+        let connection = probe
+            .connect(EndpointAddr::new(host.id()).with_relay_url(relay), ALPN)
+            .await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        send.write_all(&token).await?;
+        send.finish()?;
+        let length = recv.read_u32().await? as usize;
+        ensure!(length <= 16384, "Некорректное приглашение");
+        let mut bytes = vec![0; length];
+        recv.read_exact(&mut bytes).await?;
+        connection.close(0u8.into(), b"route checked");
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), probe.close()).await;
+    matches!(result, Ok(Ok(())))
 }
 impl Drop for InternetHost {
     fn drop(&mut self) {
@@ -225,22 +323,24 @@ pub struct InternetGuest {
 }
 impl InternetGuest {
     pub fn join(code: &str) -> Result<Self> {
-        let (id, token) = parse_code(code)?;
+        let (address, token) = parse_address_code(code)?;
+        let id = address.id;
         let (tx, rx) = mpsc::channel();
         let done = Arc::new(AtomicBool::new(false));
         for relay_only in [false, true] {
+            let address = address.clone();
             let tx = tx.clone();
             let done = done.clone();
             std::thread::spawn(move || {
                 if relay_only {
-                    std::thread::sleep(Duration::from_secs(3));
+                    std::thread::sleep(Duration::from_millis(500));
                 }
                 if done.load(Ordering::Relaxed) {
                     return;
                 }
                 let result = (|| -> Result<Self> {
                     let runtime = runtime()?;
-                    let builder = internet_builder();
+                    let builder = internet_builder()?;
                     let builder = if relay_only {
                         builder.clear_ip_transports()
                     } else {
@@ -253,13 +353,11 @@ impl InternetGuest {
                         } else {
                             crate::lan::find(id)
                         };
-                    if local.is_none() {
-                        if let Err(error) = runtime.block_on(tokio_wait_online(&endpoint)) {
-                            runtime.block_on(endpoint.close());
-                            return Err(error);
-                        }
+                    let mut address = address;
+                    if let Some(local) = local {
+                        address.addrs.extend(local.addrs);
                     }
-                    Self::join_with(runtime, endpoint, local.unwrap_or_else(|| id.into()), token)
+                    Self::join_with(runtime, endpoint, address, token)
                 })();
                 if result.is_ok() {
                     trace(if relay_only {
@@ -295,12 +393,10 @@ impl InternetGuest {
         let setup = runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(20), async {
                 // QUIC authenticates the exact public key embedded in the invitation.
-                let quic = loop {
-                    match endpoint.connect(address.clone(), ALPN).await {
-                        Ok(connection) => break connection,
-                        Err(_) => tokio::time::sleep(Duration::from_millis(750)).await,
-                    }
-                };
+                let quic = endpoint
+                    .connect(address.clone(), ALPN)
+                    .await
+                    .context("Не удалось установить защищённое соединение с хозяином")?;
                 trace("гость: QUIC установлен / открытие потока");
                 let (mut send, mut recv) = quic.open_bi().await?;
                 #[cfg(debug_assertions)]
@@ -368,35 +464,40 @@ impl InternetGuest {
         })
     }
 }
-async fn tokio_wait_online(endpoint: &Endpoint) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(8), endpoint.online())
-        .await
-        .context(
-            "Бесплатный узел связи iroh недоступен. Проверьте интернет и повторите запуск сервера",
-        )?;
-    Ok(())
-}
 impl Drop for InternetGuest {
     fn drop(&mut self) {
         self.task.abort();
         self.runtime.block_on(self.endpoint.close());
     }
 }
+#[cfg(test)]
 fn encode_code(id: EndpointId, token: &[u8; 16]) -> String {
     let mut bytes = id.as_bytes().to_vec();
     bytes.extend_from_slice(token);
     format!("TT3:{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 pub fn parse_code(code: &str) -> Result<(EndpointId, [u8; 16])> {
+    let (address, token) = parse_address_code(code)?;
+    Ok((address.id, token))
+}
+fn encode_address_code(address: &EndpointAddr, token: &[u8; 16]) -> String {
+    let bytes = serde_json::to_vec(&(address, token)).expect("serializable invitation");
+    format!("TT4:{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+fn parse_address_code(code: &str) -> Result<(EndpointAddr, [u8; 16])> {
     let value = code.trim();
+    ensure!(value.len() <= 8192, "Слишком длинный код сервера");
+    if let Some(encoded) = value.strip_prefix("TT4:") {
+        return Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?);
+    }
     ensure!(
         value.len() == 68 && value.starts_with("TT3:"),
-        "Вставьте полный код сервера, начинающийся с TT3:"
+        "Вставьте полный код сервера, начинающийся с TT4: или TT3:"
     );
     let bytes = URL_SAFE_NO_PAD.decode(&value[4..])?;
     ensure!(bytes.len() == 48, "Некорректный код");
     Ok((
-        EndpointId::from_bytes(bytes[..32].try_into()?)?,
+        EndpointId::from_bytes(bytes[..32].try_into()?)?.into(),
         bytes[32..].try_into()?,
     ))
 }
@@ -413,6 +514,22 @@ mod tests {
         assert_eq!(id, ep.id());
         assert_eq!(token, [19; 16]);
         assert!(parse_code(&code[..67]).is_err());
+        rt.block_on(ep.close());
+    }
+    #[test]
+    fn routed_code_preserves_addresses_and_legacy_codes() {
+        let rt = runtime().unwrap();
+        let ep = rt.block_on(Endpoint::bind(presets::Minimal)).unwrap();
+        let address = ep
+            .addr()
+            .with_relay_url("https://relay.example.com".parse().unwrap());
+        let code = encode_address_code(&address, &[7; 16]);
+        let (decoded, token) = parse_address_code(&code).unwrap();
+        assert_eq!(decoded, address);
+        assert_eq!(token, [7; 16]);
+        assert_eq!(parse_code(&code).unwrap().0, ep.id());
+        assert!(parse_address_code("TT4:broken").is_err());
+        assert!(parse_address_code(&format!("TT4:{}", "A".repeat(8192))).is_err());
         rt.block_on(ep.close());
     }
     #[test]

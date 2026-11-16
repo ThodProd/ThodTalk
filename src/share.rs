@@ -58,8 +58,9 @@ pub fn sources() -> Vec<SourceInfo> {
                 EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
             },
             UI::WindowsAndMessaging::{
-                EnumWindows, GWL_EXSTYLE, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
-                GetWindowThreadProcessId, IsWindowVisible, MONITORINFOF_PRIMARY, WS_EX_TOOLWINDOW,
+                EnumWindows, GWL_EXSTYLE, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
+                GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, MONITORINFOF_PRIMARY,
+                WS_EX_TOOLWINDOW,
             },
         };
         unsafe extern "system" fn collect_monitor(
@@ -93,7 +94,7 @@ pub fn sources() -> Vec<SourceInfo> {
         }
         unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
             unsafe {
-                let list = &mut *(lparam as *mut Vec<(String, isize)>);
+                let list = &mut *(lparam as *mut Vec<(String, isize, i32, i32)>);
                 if IsWindowVisible(hwnd) == 0 {
                     return 1;
                 }
@@ -118,10 +119,19 @@ pub fn sources() -> Vec<SourceInfo> {
                 let title = String::from_utf16_lossy(&buffer[..copied as usize])
                     .trim()
                     .to_owned();
-                if title.is_empty() || list.iter().any(|(existing, _)| existing == &title) {
+                if title.is_empty() || title == "Program Manager" {
                     return 1;
                 }
-                list.push((title, hwnd as isize));
+                let mut rect: RECT = std::mem::zeroed();
+                if GetWindowRect(hwnd, &mut rect) == 0 {
+                    return 1;
+                }
+                let width = rect.right - rect.left;
+                let height = rect.bottom - rect.top;
+                if width < 40 || height < 40 {
+                    return 1;
+                }
+                list.push((title, hwnd as isize, width, height));
                 1
             }
         }
@@ -152,18 +162,107 @@ pub fn sources() -> Vec<SourceInfo> {
                 });
             }
         }
-        let mut windows: Vec<(String, isize)> = Vec::new();
+        let mut windows: Vec<(String, isize, i32, i32)> = Vec::new();
         EnumWindows(Some(collect), &mut windows as *mut _ as LPARAM);
-        windows.sort_by_key(|(title, _)| title.to_lowercase());
-        for (title, handle) in windows.into_iter().take(60) {
+        windows.sort_by_key(|(title, _, _, _)| title.to_lowercase());
+        for (title, handle, width, height) in windows.into_iter().take(60) {
             result.push(SourceInfo {
                 title,
-                detail: "Окно".into(),
+                detail: format!("Окно · {width}×{height}"),
                 source: Source::Window(handle),
             });
         }
     }
     result
+}
+
+/// Physical rectangle of the monitor that hosts the sharing HUD, plus its DPI
+/// scale (1.0 = 96 DPI). Window sharing uses the monitor containing the window.
+pub fn hud_geometry(source: Source) -> Option<((i32, i32, i32, i32), f32)> {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::{
+            Foundation::{HWND, POINT},
+            Graphics::Gdi::{
+                GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+                MonitorFromPoint, MonitorFromWindow,
+            },
+            UI::{
+                HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
+                WindowsAndMessaging::IsWindow,
+            },
+        };
+        let primary = || MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let monitor = match source {
+            Source::Desktop => primary(),
+            Source::Monitor {
+                x,
+                y,
+                width,
+                height,
+            } => MonitorFromPoint(
+                POINT {
+                    x: x + width / 2,
+                    y: y + height / 2,
+                },
+                MONITOR_DEFAULTTONEAREST,
+            ),
+            Source::Window(handle) => {
+                let hwnd = handle as HWND;
+                if IsWindow(hwnd) == 0 {
+                    primary()
+                } else {
+                    MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+                }
+            }
+        };
+        if monitor.is_null() {
+            return None;
+        }
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return None;
+        }
+        let mut dpi_x = 96u32;
+        let mut dpi_y = 96u32;
+        if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) != 0 {
+            dpi_x = 96;
+        }
+        // Use the work area so the HUD sits above the Windows taskbar.
+        let rect = info.rcWork;
+        Some((
+            (
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+            ),
+            (dpi_x as f32 / 96.0).clamp(0.5, 4.0),
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = source;
+        None
+    }
+}
+
+/// Hide a window from screen capture while keeping it visible on the monitor.
+/// Used for our own sharing HUD so viewers do not see it inside the stream.
+#[cfg(windows)]
+pub fn exclude_from_capture(title: &str) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+    };
+    unsafe {
+        let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let window = FindWindowW(std::ptr::null(), title.as_ptr());
+        if window.is_null() {
+            return false;
+        }
+        SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE) != 0
+    }
 }
 
 /// Background capture loop. Stop by dropping the value.
@@ -417,6 +516,14 @@ mod tests {
     #[test]
     fn lists_desktop_source() {
         assert!(sources().iter().any(|s| s.source == Source::Desktop));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finds_monitor_for_hud() {
+        let (rect, scale) = hud_geometry(Source::Desktop).expect("нет основного монитора");
+        assert!(rect.2 > 0 && rect.3 > 0);
+        assert!((0.5..=4.0).contains(&scale));
     }
 
     #[test]

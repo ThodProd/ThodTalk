@@ -14,8 +14,28 @@ pub enum Sound {
     UserJoinChannel,
     UserLeaveChannel,
     Error,
+    ScreenShareStart,
+    ScreenShareStop,
 }
 pub fn play(sound: Sound) {
+    let wav = match sound {
+        Sound::ScreenShareStart => {
+            Some(&include_bytes!("../assets/sounds/confirmation_002.wav")[..])
+        }
+        Sound::ScreenShareStop => Some(&include_bytes!("../assets/sounds/close_002.wav")[..]),
+        _ => None,
+    };
+    if let Some(wav) = wav {
+        std::thread::spawn(move || {
+            #[cfg(windows)]
+            unsafe {
+                PlaySoundW(wav.as_ptr().cast(), std::ptr::null_mut(), 0x0004 | 0x0002);
+            }
+            #[cfg(not(windows))]
+            let _ = wav;
+        });
+        return;
+    }
     std::thread::spawn(move || {
         let notes: &[f32] = match sound {
             Sound::Join => &[660.0, 880.0],
@@ -32,6 +52,7 @@ pub fn play(sound: Sound) {
             Sound::UserJoinChannel => &[700.0, 900.0],
             Sound::UserLeaveChannel => &[700.0, 500.0],
             Sound::Error => &[400.0, 300.0],
+            Sound::ScreenShareStart | Sound::ScreenShareStop => &[],
         };
         let rate = 22050u32;
         let n = rate as usize * 65 / 1000;
@@ -68,4 +89,13 @@ pub fn play(sound: Sound) {
 #[link(name = "winmm")]
 unsafe extern "system" {
     fn PlaySoundW(sound: *const u16, module: *mut std::ffi::c_void, flags: u32) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn share_sounds_are_wav() {
+        assert!(include_bytes!("../assets/sounds/confirmation_002.wav").starts_with(b"RIFF"));
+        assert!(include_bytes!("../assets/sounds/close_002.wav").starts_with(b"RIFF"));
+    }
 }

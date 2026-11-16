@@ -20,6 +20,7 @@ enum Page {
 }
 
 const CHANNELS: [&str; 3] = ["Общий", "Игры", "Музыка"];
+const SHARE_HUD_TITLE: &str = "ThodTalk — демонстрация";
 const SETTINGS_TABS: [(ui::Icon, &str); 5] = [
     (ui::Icon::User, "Профиль"),
     (ui::Icon::Gear, "Основное"),
@@ -76,6 +77,7 @@ struct App {
     last_disconnect_time: Option<std::time::Instant>,
     last_hosting: bool,
     share: Option<thodtalk::share::ScreenShare>,
+    share_info: Option<thodtalk::share::SourceInfo>,
     screen: Option<ScreenView>,
     screen_visible: bool,
     share_picker: bool,
@@ -158,6 +160,7 @@ impl App {
             last_disconnect_time: None,
             last_hosting: false,
             share: None,
+            share_info: None,
             screen: None,
             screen_visible: true,
             share_picker: false,
@@ -243,7 +246,7 @@ impl App {
         }
         self.audio.take();
         self.voice_channel = None;
-        self.share = None;
+        self.stop_share();
         self.screen = None;
         self.screen_visible = true;
         self.share_picker = false;
@@ -290,7 +293,7 @@ impl App {
     }
     fn toggle_share(&mut self) {
         if self.share.is_some() {
-            self.share = None;
+            self.stop_share();
             return;
         }
         if self.voice_channel.is_none() {
@@ -307,8 +310,17 @@ impl App {
             return;
         };
         self.share = Some(thodtalk::share::ScreenShare::start(info.source));
+        self.share_info = Some(info);
         self.share_picker = false;
         self.screen_visible = true;
+        self.sound(thodtalk::sounds::Sound::ScreenShareStart);
+    }
+    fn stop_share(&mut self) {
+        let was_sharing = self.share.take().is_some();
+        self.share_info = None;
+        if was_sharing {
+            self.sound(thodtalk::sounds::Sound::ScreenShareStop);
+        }
     }
     /// Files dropped anywhere on the window are sent to the open text channel.
     fn dropped_files(&mut self, ctx: &egui::Context) {
@@ -391,7 +403,7 @@ impl App {
         }
         if let Some(error) = failed {
             self.error = format!("Демонстрация экрана: {error}");
-            self.share = None;
+            self.stop_share();
         }
 
         // Incoming: keep only a frame for the voice channel we are in.
@@ -603,7 +615,7 @@ impl App {
         if disconnected {
             self.audio.take();
             self.voice_channel = None;
-            self.share = None;
+            self.stop_share();
             self.screen = None;
             self.session.take();
         }
@@ -1903,6 +1915,133 @@ impl App {
             self.start_share();
         } else if cancel || !open {
             self.share_picker = false;
+        }
+    }
+
+    /// Always-on-top panel at the bottom of the shared monitor. It makes it
+    /// obvious that the screen is being broadcast and offers a stop button.
+    fn share_hud(&mut self, ctx: &egui::Context) {
+        let Some(info) = self.share_info.clone() else {
+            return;
+        };
+        if self.share.is_none() {
+            self.share_info = None;
+            return;
+        }
+        let orange = egui::Color32::from_rgb(242, 140, 54);
+        let background = egui::Color32::from_rgb(23, 22, 21);
+        let ((monitor_x, monitor_y, monitor_w, monitor_h), monitor_scale) =
+            thodtalk::share::hud_geometry(info.source).unwrap_or(((0, 0, 1280, 720), 1.0));
+        let points_per_pixel = (monitor_scale * ctx.zoom_factor()).max(0.5);
+        let width = 392.0;
+        let height = 72.0;
+        let margin = 40.0;
+        let position = egui::pos2(
+            monitor_x as f32 / points_per_pixel + monitor_w as f32 / points_per_pixel / 2.0
+                - width / 2.0,
+            (monitor_y + monitor_h) as f32 / points_per_pixel - height - margin,
+        );
+        let mut stop = false;
+        let title = info.title.clone();
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("thodtalk-share-hud"),
+            egui::ViewportBuilder::default()
+                .with_title(SHARE_HUD_TITLE)
+                .with_decorations(false)
+                .with_resizable(false)
+                .with_taskbar(false)
+                .with_active(false)
+                .with_close_button(false)
+                .with_always_on_top()
+                .with_position(position)
+                .with_inner_size([width, height]),
+            |ctx, _class| {
+                if ctx.input(|input| input.viewport().close_requested()) {
+                    stop = true;
+                }
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::new()
+                            .fill(background)
+                            .stroke(egui::Stroke::new(2.0_f32, orange))
+                            .corner_radius(10)
+                            .inner_margin(egui::Margin::symmetric(14, 10)),
+                    )
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            let (icon_rect, _) =
+                                ui.allocate_exact_size(Vec2::splat(38.0), Sense::hover());
+                            ui.painter().circle_filled(
+                                icon_rect.center(),
+                                19.0,
+                                egui::Color32::from_rgba_unmultiplied(242, 140, 54, 38),
+                            );
+                            ui::paint_icon(
+                                ui.painter(),
+                                ui::Icon::Monitor,
+                                icon_rect.shrink(10.0),
+                                orange,
+                                false,
+                            );
+                            ui.vertical(|ui| {
+                                ui.set_max_width(190.0);
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    let time = ctx.input(|input| input.time) as f32;
+                                    let pulse = 0.55 + 0.45 * (time * 3.0).sin().abs();
+                                    let (dot, _) =
+                                        ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                                    ui.painter().circle_filled(
+                                        dot.center(),
+                                        4.0,
+                                        orange.gamma_multiply(pulse),
+                                    );
+                                    ui.label(
+                                        RichText::new("Идёт демонстрация")
+                                            .size(13.5)
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    );
+                                });
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&title)
+                                            .size(11.5)
+                                            .color(egui::Color32::from_rgb(188, 181, 174)),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(&title);
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let button = egui::Button::new(
+                                    RichText::new("Завершить")
+                                        .size(13.0)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(orange)
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(9)
+                                .min_size(egui::vec2(96.0, 34.0));
+                                if ui
+                                    .add(button)
+                                    .on_hover_text("Остановить демонстрацию экрана")
+                                    .clicked()
+                                {
+                                    stop = true;
+                                }
+                            });
+                        });
+                    });
+            },
+        );
+        #[cfg(windows)]
+        thodtalk::share::exclude_from_capture(SHARE_HUD_TITLE);
+        if stop {
+            self.stop_share();
         }
     }
 
@@ -3228,6 +3367,7 @@ impl eframe::App for App {
             self.file_preview_window(ctx);
             self.screen_window(ctx);
             self.share_picker_window(ctx);
+            self.share_hud(ctx);
             return;
         }
         self.error_bar(ctx);
@@ -3257,6 +3397,7 @@ impl eframe::App for App {
         self.file_preview_window(ctx);
         self.screen_window(ctx);
         self.share_picker_window(ctx);
+        self.share_hud(ctx);
     }
 }
 fn key_string(key: &[u8]) -> String {

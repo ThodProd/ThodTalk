@@ -60,12 +60,20 @@ fn internet_builder() -> Result<iroh::endpoint::Builder> {
     } else {
         builder
     };
-    let relays = relay_candidates()?;
-    // Keep every candidate configured. The invitation contains the relay that
-    // the host actually verified; guests must be able to use a fallback relay
-    // too, instead of being limited to the first one in this list.
-    let relay_map = iroh::RelayMap::from_iter(relays);
-    Ok(builder.relay_mode(iroh::RelayMode::Custom(relay_map)))
+    // Keep iroh's built-in N0 relay selection by default. The old 0.2.1
+    // client used this path and it is more reliable than pinning a handful of
+    // regional relay hostnames which may be unavailable or slow. A custom
+    // list remains available for diagnostics/deployments through the env var.
+    if std::env::var_os("THODTALK_RELAY_URLS").is_some()
+        || std::env::var_os("THODTALK_TEST_RELAY_REGION").is_some()
+    {
+        let relays = relay_candidates()?;
+        Ok(builder.relay_mode(iroh::RelayMode::Custom(
+            iroh::RelayMap::from_iter(relays),
+        )))
+    } else {
+        Ok(builder)
+    }
 }
 fn relay_candidates() -> Result<Vec<iroh::RelayUrl>> {
     if let Ok(region) = std::env::var("THODTALK_TEST_RELAY_REGION") {
@@ -396,10 +404,18 @@ impl InternetGuest {
         let setup = runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(20), async {
                 // QUIC authenticates the exact public key embedded in the invitation.
-                let quic = endpoint
-                    .connect(address.clone(), ALPN)
-                    .await
-                    .context("Не удалось установить защищённое соединение с хозяином")?;
+                // Relay selection and DNS publication can finish shortly after
+                // the first dial. Keep retrying the same authenticated address
+                // instead of turning a transient miss into a hard timeout.
+                let quic = loop {
+                    match endpoint.connect(address.clone(), ALPN).await {
+                        Ok(connection) => break connection,
+                        Err(_) => {
+                            trace("гость: маршрут ещё не готов, повтор подключения");
+                            tokio::time::sleep(Duration::from_millis(750)).await;
+                        }
+                    }
+                };
                 trace("гость: QUIC установлен / открытие потока");
                 let (mut send, mut recv) = quic.open_bi().await?;
                 #[cfg(debug_assertions)]

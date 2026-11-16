@@ -1,4 +1,4 @@
-//! Screen sharing: capture the primary display and downscale frames to JPEG.
+//! Screen sharing: capture a monitor or a window and downscale frames to JPEG.
 //! Frames travel through the same MLS-encrypted content channel as chat.
 use anyhow::{Context, Result};
 use std::{
@@ -17,9 +17,154 @@ pub struct Frame {
     pub data: Vec<u8>,
 }
 
+/// What to capture. `Desktop` covers the whole virtual desktop (all monitors).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Desktop,
+    Monitor {
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    },
+    Window(isize),
+}
+
+/// A selectable capture source shown in the picker.
+#[derive(Clone, Debug)]
+pub struct SourceInfo {
+    pub title: String,
+    pub detail: String,
+    pub source: Source,
+}
+
 const INTERVAL: Duration = Duration::from_millis(220);
-/// Hard ceiling for one JPEG. Base64 grows it by ~33%; MAX_FRAME is 1 MiB.
+/// Hard ceiling for one JPEG. Base64 grows it by ~33%; the encrypted payload
+/// limit is 256 KiB, so this leaves comfortable headroom.
 const MAX_BYTES: usize = 160_000;
+
+/// List monitors and top-level windows that can be shared.
+pub fn sources() -> Vec<SourceInfo> {
+    let mut result = vec![SourceInfo {
+        title: "Весь экран".into(),
+        detail: "Все мониторы".into(),
+        source: Source::Desktop,
+    }];
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::{
+            Foundation::{BOOL, HWND, LPARAM, RECT},
+            Graphics::Gdi::{
+                EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+            },
+            UI::WindowsAndMessaging::{
+                EnumWindows, GWL_EXSTYLE, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
+                GetWindowThreadProcessId, IsWindowVisible, MONITORINFOF_PRIMARY, WS_EX_TOOLWINDOW,
+            },
+        };
+        unsafe extern "system" fn collect_monitor(
+            monitor: HMONITOR,
+            _device: HDC,
+            _clip: *mut RECT,
+            lparam: LPARAM,
+        ) -> BOOL {
+            unsafe {
+                let list = &mut *(lparam as *mut Vec<(bool, i32, i32, i32, i32, String)>);
+                let mut info: MONITORINFOEXW = std::mem::zeroed();
+                info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+                if GetMonitorInfoW(monitor, &mut info as *mut _ as *mut MONITORINFO) == 0 {
+                    return 1;
+                }
+                let rect = info.monitorInfo.rcMonitor;
+                let primary = info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0;
+                let name = String::from_utf16_lossy(&info.szDevice)
+                    .trim_end_matches('\0')
+                    .to_owned();
+                list.push((
+                    primary,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    name,
+                ));
+                1
+            }
+        }
+        unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            unsafe {
+                let list = &mut *(lparam as *mut Vec<(String, isize)>);
+                if IsWindowVisible(hwnd) == 0 {
+                    return 1;
+                }
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(hwnd, &mut pid);
+                if pid == std::process::id() {
+                    return 1;
+                }
+                let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+                if ex_style & WS_EX_TOOLWINDOW != 0 {
+                    return 1;
+                }
+                let length = GetWindowTextLengthW(hwnd);
+                if length <= 0 || length > 200 {
+                    return 1;
+                }
+                let mut buffer = vec![0u16; length as usize + 1];
+                let copied = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+                if copied <= 0 {
+                    return 1;
+                }
+                let title = String::from_utf16_lossy(&buffer[..copied as usize])
+                    .trim()
+                    .to_owned();
+                if title.is_empty() || list.iter().any(|(existing, _)| existing == &title) {
+                    return 1;
+                }
+                list.push((title, hwnd as isize));
+                1
+            }
+        }
+        let mut monitors: Vec<(bool, i32, i32, i32, i32, String)> = Vec::new();
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(collect_monitor),
+            &mut monitors as *mut _ as LPARAM,
+        );
+        monitors.sort_by_key(|monitor| (monitor.1, monitor.2));
+        if monitors.len() > 1 {
+            for (index, (primary, x, y, width, height, name)) in monitors.into_iter().enumerate() {
+                let title = if primary {
+                    format!("Монитор {} (основной)", index + 1)
+                } else {
+                    format!("Монитор {}", index + 1)
+                };
+                result.push(SourceInfo {
+                    title,
+                    detail: format!("{width}×{height} · {name}"),
+                    source: Source::Monitor {
+                        x,
+                        y,
+                        width,
+                        height,
+                    },
+                });
+            }
+        }
+        let mut windows: Vec<(String, isize)> = Vec::new();
+        EnumWindows(Some(collect), &mut windows as *mut _ as LPARAM);
+        windows.sort_by_key(|(title, _)| title.to_lowercase());
+        for (title, handle) in windows.into_iter().take(60) {
+            result.push(SourceInfo {
+                title,
+                detail: "Окно".into(),
+                source: Source::Window(handle),
+            });
+        }
+    }
+    result
+}
 
 /// Background capture loop. Stop by dropping the value.
 pub struct ScreenShare {
@@ -29,7 +174,7 @@ pub struct ScreenShare {
 }
 
 impl ScreenShare {
-    pub fn start() -> Self {
+    pub fn start(source: Source) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let (tx, frames) = mpsc::sync_channel(2);
@@ -37,7 +182,7 @@ impl ScreenShare {
             let mut failures = 0u32;
             while !flag.load(Ordering::Relaxed) {
                 let started = Instant::now();
-                match capture() {
+                match capture(source) {
                     Ok(frame) => {
                         failures = 0;
                         let _ = tx.try_send(Ok(frame));
@@ -75,61 +220,127 @@ impl Drop for ScreenShare {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            // A window capture can block inside GDI for an unresponsive window.
+            // Never freeze the UI waiting for it; the thread exits on its own
+            // as soon as the current capture returns.
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
         }
     }
 }
 
 #[cfg(windows)]
-fn capture() -> Result<Frame> {
+fn capture(source: Source) -> Result<Frame> {
+    let (width, height, pixels) = unsafe { grab(source)? };
+    encode(width, height, pixels)
+}
+
+#[cfg(windows)]
+unsafe fn grab(source: Source) -> Result<(i32, i32, Vec<u8>)> {
     use windows_sys::Win32::{
-        Foundation::HWND,
+        Foundation::{HWND, RECT},
         Graphics::Gdi::{
-            BITMAPINFO, BITMAPINFOHEADER, BitBlt, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC,
-            GetDIBits, CreateCompatibleBitmap, CreateCompatibleDC, ReleaseDC, SelectObject, SRCCOPY,
+            BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
+            DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, GetWindowDC, ReleaseDC,
+            SRCCOPY, SelectObject,
         },
-        UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN},
+        Storage::Xps::PrintWindow,
+        UI::WindowsAndMessaging::{
+            GetSystemMetrics, GetWindowRect, IsWindow, PW_RENDERFULLCONTENT, SM_CXVIRTUALSCREEN,
+            SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+        },
     };
 
-    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    anyhow::ensure!(width > 0 && height > 0, "Не удалось определить размер экрана");
-
-    let screen = unsafe { GetDC(std::ptr::null_mut::<std::ffi::c_void>() as HWND) };
-    anyhow::ensure!(!screen.is_null(), "Нет доступа к экрану");
-    let memory = unsafe { CreateCompatibleDC(screen) };
-    if memory.is_null() {
-        unsafe { ReleaseDC(std::ptr::null_mut::<std::ffi::c_void>() as HWND, screen) };
-        anyhow::bail!("Не удалось создать буфер экрана");
-    }
-    let bitmap = unsafe { CreateCompatibleBitmap(screen, width, height) };
-    if bitmap.is_null() {
-        unsafe {
-            DeleteDC(memory);
-            ReleaseDC(std::ptr::null_mut::<std::ffi::c_void>() as HWND, screen);
+    unsafe {
+        let null = std::ptr::null_mut();
+        let (device, release, x, y, width, height) = match source {
+            Source::Desktop => {
+                let width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+                let height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                if width <= 0 || height <= 0 {
+                    anyhow::bail!("Не удалось определить размер экрана");
+                }
+                let device = GetDC(null);
+                (
+                    device,
+                    null,
+                    GetSystemMetrics(SM_XVIRTUALSCREEN),
+                    GetSystemMetrics(SM_YVIRTUALSCREEN),
+                    width,
+                    height,
+                )
+            }
+            Source::Monitor {
+                x,
+                y,
+                width,
+                height,
+            } => (GetDC(null), null, x, y, width, height),
+            Source::Window(handle) => {
+                let hwnd = handle as HWND;
+                if IsWindow(hwnd) == 0 {
+                    anyhow::bail!("Окно закрыто");
+                }
+                let mut rect: RECT = std::mem::zeroed();
+                if GetWindowRect(hwnd, &mut rect) == 0 {
+                    anyhow::bail!("Не удалось получить размер окна");
+                }
+                let width = rect.right - rect.left;
+                let height = rect.bottom - rect.top;
+                (GetWindowDC(hwnd), hwnd, 0, 0, width, height)
+            }
+        };
+        if device.is_null() {
+            anyhow::bail!("Нет доступа к экрану или окну");
         }
-        anyhow::bail!("Не удалось создать снимок экрана");
-    }
+        if width <= 0
+            || height <= 0
+            || width > 8192
+            || height > 8192
+            || width as i64 * height as i64 > 40_000_000
+        {
+            ReleaseDC(release, device);
+            anyhow::bail!("Слишком большой размер области захвата");
+        }
 
-    let previous = unsafe { SelectObject(memory, bitmap) };
-    let copied = unsafe { BitBlt(memory, 0, 0, width, height, screen, 0, 0, SRCCOPY) };
-    // GetDIBits requires the bitmap to be released from the device context.
-    unsafe { SelectObject(memory, previous) };
+        let memory = CreateCompatibleDC(device);
+        if memory.is_null() {
+            ReleaseDC(release, device);
+            anyhow::bail!("Не удалось создать буфер экрана");
+        }
+        let bitmap = CreateCompatibleBitmap(device, width, height);
+        if bitmap.is_null() {
+            DeleteDC(memory);
+            ReleaseDC(release, device);
+            anyhow::bail!("Не удалось создать снимок экрана");
+        }
+        let previous = SelectObject(memory, bitmap);
+        let copied = match source {
+            Source::Desktop | Source::Monitor { .. } => {
+                BitBlt(memory, 0, 0, width, height, device, x, y, SRCCOPY) != 0
+            }
+            Source::Window(handle) => {
+                let printed = PrintWindow(handle as HWND, memory, PW_RENDERFULLCONTENT) != 0;
+                printed || BitBlt(memory, 0, 0, width, height, device, 0, 0, SRCCOPY) != 0
+            }
+        };
+        // GetDIBits requires the bitmap to be released from the device context.
+        SelectObject(memory, previous);
 
-    let mut info: BITMAPINFO = unsafe { std::mem::zeroed() };
-    info.bmiHeader = BITMAPINFOHEADER {
-        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-        biWidth: width,
-        // Negative height keeps rows top-down.
-        biHeight: -height,
-        biPlanes: 1,
-        biBitCount: 32,
-        biCompression: 0,
-        ..unsafe { std::mem::zeroed() }
-    };
-    let mut pixels = vec![0u8; width as usize * height as usize * 4];
-    let lines = unsafe {
-        GetDIBits(
+        let mut info: BITMAPINFO = std::mem::zeroed();
+        info.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            // Negative height keeps rows top-down.
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: 0,
+            ..std::mem::zeroed()
+        };
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        let lines = GetDIBits(
             memory,
             bitmap,
             0,
@@ -137,18 +348,19 @@ fn capture() -> Result<Frame> {
             pixels.as_mut_ptr().cast(),
             &mut info,
             DIB_RGB_COLORS,
-        )
-    };
-    unsafe {
+        );
         DeleteObject(bitmap);
         DeleteDC(memory);
-        ReleaseDC(std::ptr::null_mut::<std::ffi::c_void>() as HWND, screen);
+        ReleaseDC(release, device);
+        anyhow::ensure!(
+            copied && lines == height,
+            "Windows не отдал изображение экрана или окна"
+        );
+        Ok((width, height, pixels))
     }
-    anyhow::ensure!(
-        copied != 0 && lines == height,
-        "Windows не отдал изображение экрана"
-    );
+}
 
+fn encode(width: i32, height: i32, pixels: Vec<u8>) -> Result<Frame> {
     let rgb: Vec<u8> = pixels
         .chunks_exact(4)
         .flat_map(|px| [px[2], px[1], px[0]])
@@ -180,7 +392,7 @@ fn capture() -> Result<Frame> {
 }
 
 #[cfg(not(windows))]
-fn capture() -> Result<Frame> {
+fn capture(_source: Source) -> Result<Frame> {
     anyhow::bail!("Демонстрация экрана поддерживается только в Windows")
 }
 
@@ -191,7 +403,7 @@ mod tests {
     #[test]
     #[ignore = "captures the real desktop"]
     fn captures_a_frame() {
-        let share = ScreenShare::start();
+        let share = ScreenShare::start(Source::Desktop);
         let frame = share
             .frames
             .recv_timeout(Duration::from_secs(5))
@@ -200,5 +412,31 @@ mod tests {
         assert!(frame.width >= 2 && frame.height >= 2);
         assert!(!frame.data.is_empty() && frame.data.len() <= MAX_BYTES);
         image::load_from_memory(&frame.data).expect("кадр не декодируется");
+    }
+
+    #[test]
+    fn lists_desktop_source() {
+        assert!(sources().iter().any(|s| s.source == Source::Desktop));
+    }
+
+    #[test]
+    #[ignore = "captures a real window"]
+    fn captures_a_window() {
+        let mut last_error = None;
+        for info in sources()
+            .into_iter()
+            .filter(|s| matches!(s.source, Source::Window(_)))
+        {
+            match capture(info.source) {
+                Ok(frame) => {
+                    assert!(frame.width >= 2 && frame.height >= 2);
+                    assert!(!frame.data.is_empty() && frame.data.len() <= MAX_BYTES);
+                    image::load_from_memory(&frame.data).expect("кадр не декодируется");
+                    return;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        panic!("не удалось захватить ни одно окно: {last_error:?}");
     }
 }

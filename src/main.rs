@@ -78,6 +78,10 @@ struct App {
     share: Option<thodtalk::share::ScreenShare>,
     screen: Option<ScreenView>,
     screen_visible: bool,
+    share_picker: bool,
+    share_sources: Vec<thodtalk::share::SourceInfo>,
+    share_source: usize,
+    file_preview: Option<(uuid::Uuid, String, u64)>,
     _lock: std::fs::File,
 }
 
@@ -156,6 +160,10 @@ impl App {
             share: None,
             screen: None,
             screen_visible: true,
+            share_picker: false,
+            share_sources: Vec::new(),
+            share_source: 0,
+            file_preview: None,
             _lock: lock,
         };
         app.input_device = app.profile.input_device.clone();
@@ -238,6 +246,7 @@ impl App {
         self.share = None;
         self.screen = None;
         self.screen_visible = true;
+        self.share_picker = false;
         if let Some(session) = &mut self.session {
             let _ = session.send(Payload::VoiceState {
                 channel: None,
@@ -252,7 +261,7 @@ impl App {
             return;
         }
         match Audio::start_with_opts(
-            &self.input_device, 
+            &self.input_device,
             &self.output_device,
             self.profile.ffmpeg_noise_suppression,
             self.profile.voice_enhancement,
@@ -288,7 +297,18 @@ impl App {
             self.error = "Сначала войдите в голосовой канал".into();
             return;
         }
-        self.share = Some(thodtalk::share::ScreenShare::start());
+        self.share_sources = thodtalk::share::sources();
+        self.share_source = 0;
+        self.share_picker = true;
+    }
+    fn start_share(&mut self) {
+        let Some(info) = self.share_sources.get(self.share_source).cloned() else {
+            self.error = "Не выбран источник демонстрации".into();
+            return;
+        };
+        self.share = Some(thodtalk::share::ScreenShare::start(info.source));
+        self.share_picker = false;
+        self.screen_visible = true;
     }
     /// Files dropped anywhere on the window are sent to the open text channel.
     fn dropped_files(&mut self, ctx: &egui::Context) {
@@ -557,7 +577,9 @@ impl App {
                     }
                 }
                 for (author, channel, data) in session.voice_in.drain(..) {
-                    if self.voice_channel.as_ref() == Some(&channel) && !self.profile.muted_users.contains(&author) {
+                    if self.voice_channel.as_ref() == Some(&channel)
+                        && !self.profile.muted_users.contains(&author)
+                    {
                         let gain = self
                             .profile
                             .volumes
@@ -957,7 +979,8 @@ impl App {
                     .screen
                     .as_ref()
                     .is_some_and(|view| view.updated.elapsed() < Duration::from_secs(3));
-                if available && !sharing
+                if available
+                    && !sharing
                     && ui::icon_btn(
                         ui,
                         light,
@@ -1178,8 +1201,7 @@ impl App {
                 (44.0, 32.0, 0.0)
             };
             let in_voice = member.voice.is_some();
-            let show_icon = (member.muted || member.deafened) && in_voice
-                || (!compact && in_voice);
+            let show_icon = (member.muted || member.deafened) && in_voice || (!compact && in_voice);
             let icon_width = if member.deafened {
                 44.0
             } else if show_icon {
@@ -1188,39 +1210,32 @@ impl App {
                 4.0
             };
             let textures = &self.member_textures;
-            let response = ui::row(
-                ui,
-                light,
-                height,
-                indent,
-                icon_width,
-                |ui| {
-                    let mut avatar = ui::Avatar::new(
-                        textures.get(&key).map(|(_, t)| t),
-                        &member.name,
-                        avatar_size,
+            let response = ui::row(ui, light, height, indent, icon_width, |ui| {
+                let mut avatar = ui::Avatar::new(
+                    textures.get(&key).map(|(_, t)| t),
+                    &member.name,
+                    avatar_size,
+                )
+                .ring(speaking.then(|| ui::success(light)));
+                if !compact {
+                    avatar = avatar.status(ui::GREEN, ui::sidebar(light));
+                }
+                avatar.show(ui);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&member.name)
+                            .size(if compact { 14.0 } else { 14.5 })
+                            .color(if speaking {
+                                ui::success(light)
+                            } else if compact {
+                                ui::muted(light)
+                            } else {
+                                ui::text(light)
+                            }),
                     )
-                    .ring(speaking.then(|| ui::success(light)));
-                    if !compact {
-                        avatar = avatar.status(ui::GREEN, ui::sidebar(light));
-                    }
-                    avatar.show(ui);
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(&member.name)
-                                .size(if compact { 14.0 } else { 14.5 })
-                                .color(if speaking {
-                                    ui::success(light)
-                                } else if compact {
-                                    ui::muted(light)
-                                } else {
-                                    ui::text(light)
-                                }),
-                        )
-                        .truncate(),
-                    );
-                },
-            );
+                    .truncate(),
+                );
+            });
             if member.deafened {
                 // Полностью выключен звук: и микрофон, и наушники перечёркнуты.
                 let color = ui::danger(light);
@@ -1724,7 +1739,172 @@ impl App {
         }
     }
 
+    fn file_preview_window(&mut self, ctx: &egui::Context) {
+        let Some((id, name, size)) = self.file_preview.clone() else {
+            return;
+        };
+        let light = self.profile.light_theme;
+        let mut save = false;
+        let mut open = false;
+        let mut close = false;
+        let mut window_open = true;
+        egui::Window::new("Файл")
+            .id(egui::Id::new("file-preview"))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut window_open)
+            .show(ctx, |ui| {
+                ui.set_width(430.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    let (rect, _) =
+                        ui.allocate_exact_size(Vec2::splat(42.0), Sense::hover());
+                    ui::paint_icon(
+                        ui.painter(),
+                        ui::Icon::File,
+                        rect.shrink(3.0),
+                        ui::accent(light),
+                        false,
+                    );
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&name).size(15.0).strong(),
+                            )
+                            .wrap(),
+                        );
+                        ui.label(
+                            RichText::new(file_size(size))
+                                .size(12.0)
+                                .color(ui::muted(light)),
+                        );
+                    });
+                });
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(
+                        "Открывайте только файлы от людей, которым доверяете: они могут содержать вирусы.",
+                    )
+                    .size(12.0)
+                    .color(ui::muted(light)),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.add(ui::primary("Скачать")).clicked() {
+                        save = true;
+                    }
+                    if ui.add(ui::secondary("Открыть")).clicked() {
+                        open = true;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(ui::secondary("Закрыть")).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+        if save {
+            match save_file(&self.store, id, &name) {
+                Ok(()) => close = true,
+                Err(error) => self.error = error.to_string(),
+            }
+        }
+        if open {
+            match open_file(&self.store, id, &name) {
+                Ok(()) => close = true,
+                Err(error) => self.error = error.to_string(),
+            }
+        }
+        if close || !window_open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.file_preview = None;
+        }
+    }
+
     // ───────────────────────── Чат ─────────────────────────
+
+    fn share_picker_window(&mut self, ctx: &egui::Context) {
+        if !self.share_picker {
+            return;
+        }
+        let light = self.profile.light_theme;
+        let mut open = true;
+        let mut start = false;
+        let mut cancel = false;
+        let mut refresh = false;
+        egui::Window::new("Поделиться экраном")
+            .id(egui::Id::new("share-picker"))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.label(
+                    RichText::new("Что показывать?")
+                        .size(16.0)
+                        .strong()
+                        .color(ui::text(light)),
+                );
+                ui.label(
+                    RichText::new(
+                        "Выберите весь экран или отдельное окно. Демонстрацию увидят все участники сервера, звук не передаётся.",
+                    )
+                    .size(12.5)
+                    .color(ui::muted(light)),
+                );
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("share-sources")
+                    .max_height(300.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for (index, source) in self.share_sources.iter().enumerate() {
+                            let text = format!("{}\n{}", source.title, source.detail);
+                            let response = ui.selectable_value(
+                                &mut self.share_source,
+                                index,
+                                RichText::new(text).size(13.0),
+                            );
+                            if response.double_clicked() {
+                                self.share_source = index;
+                                start = true;
+                            }
+                        }
+                    });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.add(ui::primary("Начать трансляцию")).clicked() {
+                        start = true;
+                    }
+                    if ui.add(ui::secondary("Отмена")).clicked() {
+                        cancel = true;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add(ui::secondary("Обновить список"))
+                            .on_hover_text("Перечитать открытые окна")
+                            .clicked()
+                        {
+                            refresh = true;
+                        }
+                    });
+                });
+            });
+        if refresh {
+            self.share_sources = thodtalk::share::sources();
+            self.share_source = self
+                .share_source
+                .min(self.share_sources.len().saturating_sub(1));
+        }
+        if start {
+            self.start_share();
+        } else if cancel || !open {
+            self.share_picker = false;
+        }
+    }
 
     fn screen_window(&mut self, ctx: &egui::Context) {
         let light = self.profile.light_theme;
@@ -1929,18 +2109,12 @@ impl App {
             let channel = self.channel.clone();
             if let Some(session) = &self.session {
                 let own = session.own_key();
-                if let Some(m) = session
-                    .history
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|m| {
-                        m.channel == channel
-                            && m.author_key == own
-                            && m.image.is_none()
-                            && m.file.is_none()
-                    })
-                {
+                if let Some(m) = session.history.messages.iter().rev().find(|m| {
+                    m.channel == channel
+                        && m.author_key == own
+                        && m.image.is_none()
+                        && m.file.is_none()
+                }) {
                     self.draft = m.text.clone();
                     self.editing_message = Some(m.id);
                     self.focus_composer = true;
@@ -2070,6 +2244,7 @@ impl App {
         // 0 — редактировать, 1 — удалить у себя, 2 — удалить у всех.
         let mut action: Option<(uuid::Uuid, u8)> = None;
         let mut save_existing: Option<(uuid::Uuid, String)> = None;
+        let mut open_existing: Option<(uuid::Uuid, String, u64)> = None;
         egui::ScrollArea::vertical()
             .id_salt(("messages", &channel))
             .stick_to_bottom(true)
@@ -2249,28 +2424,46 @@ impl App {
                                                     ui.with_layout(
                                                         Layout::right_to_left(Align::Center),
                                                         |ui| {
-                                                            if ui::icon_btn_sized(
-                                                                ui,
-                                                                light,
+                                                            let (rect, response) = ui
+                                                                .allocate_exact_size(
+                                                                    Vec2::splat(26.0),
+                                                                    Sense::hover(),
+                                                                );
+                                                            ui::paint_icon(
+                                                                ui.painter(),
                                                                 ui::Icon::Download,
-                                                                ui::Tone::Normal,
+                                                                rect.shrink(4.0),
+                                                                ui::muted(light),
                                                                 false,
-                                                                30.0,
-                                                            )
-                                                            .on_hover_text(
-                                                                "Сохранить на компьютер",
-                                                            )
-                                                            .clicked()
-                                                            {
-                                                                save_existing =
-                                                                    Some((m.id, file.name.clone()));
-                                                            }
+                                                            );
+                                                            response.on_hover_text(
+                                                                "Нажмите на карточку, чтобы открыть или сохранить",
+                                                            );
                                                         },
                                                     );
                                                 });
                                             })
                                             .response;
-                                        card.context_menu(|ui| {
+                                        let response = ui.interact(
+                                            card.rect,
+                                            ui.id().with(("file-card", m.id)),
+                                            Sense::click(),
+                                        );
+                                        if response.hovered() {
+                                            ui.ctx()
+                                                .set_cursor_icon(egui::CursorIcon::PointingHand);
+                                            ui.painter().rect_stroke(
+                                                card.rect,
+                                                egui::CornerRadius::same(8),
+                                                egui::Stroke::new(1.0_f32, ui::accent(light)),
+                                                egui::StrokeKind::Inside,
+                                            );
+                                        }
+                                        if response.clicked() {
+                                            open_existing =
+                                                Some((m.id, file.name.clone(), file.size));
+                                        }
+                                        response.context_menu(|ui| {
                                             if ui.button("Сохранить на компьютер").clicked() {
                                                 save_existing =
                                                     Some((m.id, file.name.clone()));
@@ -2323,6 +2516,9 @@ impl App {
             if let Err(e) = save_file(&self.store, id, &name) {
                 self.error = e.to_string();
             }
+        }
+        if let Some((id, name, size)) = open_existing {
+            self.file_preview = Some((id, name, size));
         }
         if let Some((id, kind)) = action {
             match kind {
@@ -3029,7 +3225,9 @@ impl eframe::App for App {
             self.settings_screen(ctx);
             self.member_card(ctx);
             self.image_preview(ctx);
+            self.file_preview_window(ctx);
             self.screen_window(ctx);
+            self.share_picker_window(ctx);
             return;
         }
         self.error_bar(ctx);
@@ -3056,7 +3254,9 @@ impl eframe::App for App {
         }
         self.member_card(ctx);
         self.image_preview(ctx);
+        self.file_preview_window(ctx);
         self.screen_window(ctx);
+        self.share_picker_window(ctx);
     }
 }
 fn key_string(key: &[u8]) -> String {
@@ -3216,9 +3416,28 @@ fn safe_file_name(name: &str) -> String {
     let stem = cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();
     let reserved = matches!(
         stem.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL"
-            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
-            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
     );
     let cleaned = cleaned.chars().take(120).collect::<String>();
     if reserved {
@@ -3236,6 +3455,36 @@ fn save_file(store: &Store, id: uuid::Uuid, name: &str) -> anyhow::Result<()> {
         .save_file()
     {
         std::fs::write(path, bytes)?;
+    }
+    Ok(())
+}
+
+fn open_file(store: &Store, id: uuid::Uuid, name: &str) -> anyhow::Result<()> {
+    let bytes = thodtalk::attachments::load_bytes(store, id)?
+        .ok_or_else(|| anyhow::anyhow!("Файл не найден"))?;
+    let directory = std::env::temp_dir().join("thodtalk-open");
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{id}-{}", safe_file_name(name)));
+    std::fs::write(&path, &bytes)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Mark the extracted copy as downloaded so Windows can warn about
+        // executable content before it runs.
+        let _ = std::fs::write(
+            format!("{}:Zone.Identifier", path.display()),
+            "[ZoneTransfer]\r\nZoneId=3\r\n",
+        );
+        let target = path.to_string_lossy().into_owned();
+        std::process::Command::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(target)
+            .creation_flags(0x0800_0000)
+            .spawn()?;
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("xdg-open").arg(&path).spawn()?;
     }
     Ok(())
 }

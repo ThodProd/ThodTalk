@@ -45,6 +45,17 @@ enum Request {
         channel: String,
         path: std::path::PathBuf,
     },
+    File {
+        channel: String,
+        path: std::path::PathBuf,
+    },
+    Screen {
+        channel: String,
+        width: u32,
+        height: u32,
+        #[serde(with = "crate::wire::binary")]
+        data: Vec<u8>,
+    },
     Kick(Vec<u8>),
     Ban(Vec<u8>),
     Closed(bool),
@@ -53,6 +64,14 @@ enum Request {
 enum Event {
     State(Snapshot),
     Voice(Vec<(Vec<u8>, String, Vec<u8>)>),
+    Screen {
+        author: Vec<u8>,
+        channel: String,
+        width: u32,
+        height: u32,
+        #[serde(with = "crate::wire::binary")]
+        data: Vec<u8>,
+    },
     Error(String),
     Fatal(String),
 }
@@ -86,6 +105,7 @@ pub struct SessionProxy {
     pub ping_ms: Option<u32>,
     pub invite: Option<()>,
     pub voice_in: Vec<(Vec<u8>, String, Vec<u8>)>,
+    pub screen_in: Option<(Vec<u8>, String, u32, u32, Vec<u8>)>,
 }
 fn read<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> Result<T> {
     let mut line = Vec::new();
@@ -195,6 +215,7 @@ impl SessionProxy {
             ping_ms: None,
             invite: None,
             voice_in: Vec::new(),
+            screen_in: None,
         };
         result.request(Request::Start {
             hosting,
@@ -246,6 +267,15 @@ impl SessionProxy {
                     }
                 }
             }
+            Event::Screen {
+                author,
+                channel,
+                width,
+                height,
+                data,
+            } => {
+                self.screen_in = Some((author, channel, width, height, data));
+            }
             Event::Error(error) => self.status = error,
             Event::Fatal(error) => anyhow::bail!("{error}"),
         }
@@ -287,6 +317,12 @@ impl SessionProxy {
     pub fn kick(&mut self, key: &[u8]) -> Result<()> {
         self.request(Request::Kick(key.into()))
     }
+    pub fn file(&mut self, channel: &str, path: std::path::PathBuf) -> Result<()> {
+        self.request(Request::File {
+            channel: channel.into(),
+            path,
+        })
+    }
     pub fn send(&mut self, payload: Payload) -> Result<()> {
         self.request(Request::Payload(payload))
     }
@@ -294,6 +330,20 @@ impl SessionProxy {
         self.request(Request::Chat {
             channel: channel.into(),
             text: text.into(),
+        })
+    }
+    pub fn share_screen(
+        &mut self,
+        channel: &str,
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        self.request(Request::Screen {
+            channel: channel.into(),
+            width,
+            height,
+            data,
         })
     }
     pub fn edit_chat(&mut self, id: uuid::Uuid, text: &str) -> Result<()> {
@@ -357,6 +407,7 @@ fn revision(session: &Session) -> u64 {
         message.text.hash(&mut hash);
         message.channel.hash(&mut hash);
         message.edited.hash(&mut hash);
+        message.file.hash(&mut hash);
         message.timestamp_ms.hash(&mut hash);
         message.image.hash(&mut hash);
     }
@@ -418,6 +469,13 @@ pub fn run() -> Result<()> {
                 Request::Payload(payload) => session.send(payload),
                 Request::Profile(profile) => session.update_profile(profile),
                 Request::Image { channel, path } => session.image(&channel, &path),
+                Request::File { channel, path } => session.file(&channel, &path),
+                Request::Screen {
+                    channel,
+                    width,
+                    height,
+                    data,
+                } => session.screen(&channel, width, height, data),
                 Request::Kick(key) => session.kick(&key),
                 Request::Ban(key) => session.ban(&key),
                 Request::Closed(value) => {
@@ -437,6 +495,18 @@ pub fn run() -> Result<()> {
         if !session.voice_in.is_empty() {
             write(
                 &Event::Voice(std::mem::take(&mut session.voice_in)),
+                &mut output,
+            )?;
+        }
+        if let Some((author, channel, width, height, data)) = session.screen_in.take() {
+            write(
+                &Event::Screen {
+                    author,
+                    channel,
+                    width,
+                    height,
+                    data,
+                },
                 &mut output,
             )?;
         }

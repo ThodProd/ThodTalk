@@ -6,6 +6,7 @@ pub mod internet;
 mod lan;
 pub mod relay;
 pub mod session;
+pub mod share;
 pub mod sounds;
 pub mod storage;
 pub mod transport;

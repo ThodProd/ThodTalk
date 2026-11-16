@@ -2,6 +2,7 @@
 /dist/
 /test-data/
 /Release_v0.3.2/
+/Release_v0.3.3/
 ThodTalk_v*.zip
 *.log
 .env

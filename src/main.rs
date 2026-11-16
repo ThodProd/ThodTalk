@@ -75,7 +75,16 @@ struct App {
     reconnect_attempts: u32,
     last_disconnect_time: Option<std::time::Instant>,
     last_hosting: bool,
+    share: Option<thodtalk::share::ScreenShare>,
+    screen: Option<ScreenView>,
+    screen_visible: bool,
     _lock: std::fs::File,
+}
+
+struct ScreenView {
+    texture: egui::TextureHandle,
+    author: Vec<u8>,
+    updated: std::time::Instant,
 }
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, store: Store, lock: std::fs::File) -> Self {
@@ -144,6 +153,9 @@ impl App {
             reconnect_attempts: 0,
             last_disconnect_time: None,
             last_hosting: false,
+            share: None,
+            screen: None,
+            screen_visible: true,
             _lock: lock,
         };
         app.input_device = app.profile.input_device.clone();
@@ -223,6 +235,9 @@ impl App {
         }
         self.audio.take();
         self.voice_channel = None;
+        self.share = None;
+        self.screen = None;
+        self.screen_visible = true;
         if let Some(session) = &mut self.session {
             let _ = session.send(Payload::VoiceState {
                 channel: None,
@@ -262,6 +277,139 @@ impl App {
             self.profile.muted_users.remove(&key);
         } else {
             self.profile.muted_users.insert(key);
+        }
+    }
+    fn toggle_share(&mut self) {
+        if self.share.is_some() {
+            self.share = None;
+            return;
+        }
+        if self.voice_channel.is_none() {
+            self.error = "Сначала войдите в голосовой канал".into();
+            return;
+        }
+        self.share = Some(thodtalk::share::ScreenShare::start());
+    }
+    /// Files dropped anywhere on the window are sent to the open text channel.
+    fn dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() || self.editing {
+            return;
+        }
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        if !session.ready() {
+            self.error = "Дождитесь подключения к серверу".into();
+            return;
+        }
+        for file in dropped {
+            let Some(path) = file.path else {
+                continue;
+            };
+            let result = if is_image_path(&path) {
+                session.image(&self.channel, path)
+            } else {
+                session.file(&self.channel, path)
+            };
+            if let Err(error) = result {
+                self.error = error.to_string();
+            }
+        }
+    }
+    fn drop_hint(&self, ctx: &egui::Context) {
+        if self.editing || self.session.is_none() {
+            return;
+        }
+        let count = ctx.input(|i| i.raw.hovered_files.len());
+        if count == 0 {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("drop-hint"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(130));
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!(
+                        "Отпустите, чтобы отправить в #{}\nФайлов: {count}",
+                        self.channel
+                    ),
+                    egui::FontId::proportional(20.0),
+                    egui::Color32::WHITE,
+                );
+            });
+    }
+    fn pump_screen(&mut self, ctx: &egui::Context) {
+        // Outgoing: hand frames captured in the background to the session worker.
+        let mut failed = None;
+        if let Some(share) = &self.share {
+            while let Ok(result) = share.frames.try_recv() {
+                match result {
+                    Ok(frame) => {
+                        if let (Some(session), Some(channel)) =
+                            (&mut self.session, &self.voice_channel)
+                        {
+                            if let Err(error) =
+                                session.share_screen(channel, frame.width, frame.height, frame.data)
+                            {
+                                self.error = error.to_string();
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(error) = failed {
+            self.error = format!("Демонстрация экрана: {error}");
+            self.share = None;
+        }
+
+        // Incoming: keep only a frame for the voice channel we are in.
+        let frame = self.session.as_mut().and_then(|s| s.screen_in.take());
+        let Some((author, channel, _width, _height, data)) = frame else {
+            return;
+        };
+        let own_key = self.session.as_ref().map(|s| s.own_key());
+        if self.voice_channel.as_deref() != Some(channel.as_str())
+            || own_key.as_deref() == Some(author.as_slice())
+        {
+            return;
+        }
+        let Some(color) = screen_image(&data) else {
+            return;
+        };
+        let switched = self
+            .screen
+            .as_ref()
+            .is_some_and(|view| view.author != author);
+        let fresh = self.screen.is_none();
+        match &mut self.screen {
+            Some(view) => {
+                view.texture.set(color, egui::TextureOptions::LINEAR);
+                view.author = author;
+                view.updated = std::time::Instant::now();
+            }
+            None => {
+                let texture = ctx.load_texture("screen-share", color, egui::TextureOptions::LINEAR);
+                self.screen = Some(ScreenView {
+                    texture,
+                    author,
+                    updated: std::time::Instant::now(),
+                });
+            }
+        }
+        if switched || fresh {
+            self.screen_visible = true;
         }
     }
     fn tick(&mut self, ctx: &egui::Context) {
@@ -433,8 +581,11 @@ impl App {
         if disconnected {
             self.audio.take();
             self.voice_channel = None;
+            self.share = None;
+            self.screen = None;
             self.session.take();
         }
+        self.pump_screen(ctx);
         if self.session.is_some() || self.connecting.is_some() {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -727,6 +878,8 @@ impl App {
     /// Нижняя панель как в Discord: статус голоса и «я» с кнопками микрофона, звука и настроек.
     fn account_panel(&mut self, ui: &mut egui::Ui) {
         let light = self.profile.light_theme;
+        let mut toggle_share = false;
+        let mut toggle_watch = false;
         if let Some(channel) = self.voice_channel.clone() {
             let mut leave = false;
             let (rect, _) =
@@ -779,6 +932,52 @@ impl App {
                 {
                     leave = true;
                 }
+                let sharing = self.share.is_some();
+                if ui::icon_btn(
+                    ui,
+                    light,
+                    ui::Icon::Monitor,
+                    if sharing {
+                        ui::Tone::Active
+                    } else {
+                        ui::Tone::Normal
+                    },
+                    false,
+                )
+                .on_hover_text(if sharing {
+                    "Остановить демонстрацию экрана"
+                } else {
+                    "Демонстрация экрана"
+                })
+                .clicked()
+                {
+                    toggle_share = true;
+                }
+                let available = self
+                    .screen
+                    .as_ref()
+                    .is_some_and(|view| view.updated.elapsed() < Duration::from_secs(3));
+                if available && !sharing
+                    && ui::icon_btn(
+                        ui,
+                        light,
+                        ui::Icon::Eye,
+                        if self.screen_visible {
+                            ui::Tone::Active
+                        } else {
+                            ui::Tone::Normal
+                        },
+                        false,
+                    )
+                    .on_hover_text(if self.screen_visible {
+                        "Скрыть демонстрацию экрана"
+                    } else {
+                        "Смотреть демонстрацию экрана"
+                    })
+                    .clicked()
+                {
+                    toggle_watch = true;
+                }
             });
             ui.add_space(4.0);
             ui.painter().hline(
@@ -789,6 +988,12 @@ impl App {
             ui.add_space(6.0);
             if leave {
                 self.stop_voice();
+            }
+            if toggle_share {
+                self.toggle_share();
+            }
+            if toggle_watch {
+                self.screen_visible = !self.screen_visible;
             }
         }
 
@@ -1521,6 +1726,52 @@ impl App {
 
     // ───────────────────────── Чат ─────────────────────────
 
+    fn screen_window(&mut self, ctx: &egui::Context) {
+        let light = self.profile.light_theme;
+        let Some(view) = &self.screen else {
+            return;
+        };
+        if !self.screen_visible || view.updated.elapsed() > Duration::from_secs(3) {
+            return;
+        }
+        let texture = view.texture.clone();
+        let author = view.author.clone();
+        let name = self
+            .session
+            .as_ref()
+            .and_then(|s| s.members.get(&author).map(|m| m.name.clone()))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "Участник".into());
+        let source = texture.size_vec2();
+        let max = egui::vec2(
+            (ctx.screen_rect().width() * 0.72).clamp(320.0, 1100.0),
+            (ctx.screen_rect().height() * 0.62).max(200.0),
+        );
+        let scale = (max.x / source.x).min(max.y / source.y).min(1.0);
+        let mut hide = false;
+        egui::Window::new(format!("Демонстрация экрана · {name}"))
+            .id(egui::Id::new("screen-viewer"))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.add(egui::Image::new((texture.id(), source * scale)).corner_radius(8));
+                ui.horizontal(|ui| {
+                    if ui.button("Скрыть").clicked() {
+                        hide = true;
+                    }
+                    ui.label(
+                        RichText::new("Демонстрация обновляется в реальном времени")
+                            .size(11.5)
+                            .color(ui::muted(light)),
+                    );
+                });
+            });
+        if hide {
+            self.screen_visible = false;
+        }
+    }
+
     fn chat_bar(&mut self, ctx: &egui::Context) {
         let light = self.profile.light_theme;
         let (status, hosting, code, closed) = {
@@ -1683,7 +1934,12 @@ impl App {
                     .messages
                     .iter()
                     .rev()
-                    .find(|m| m.channel == channel && m.author_key == own && m.image.is_none())
+                    .find(|m| {
+                        m.channel == channel
+                            && m.author_key == own
+                            && m.image.is_none()
+                            && m.file.is_none()
+                    })
                 {
                     self.draft = m.text.clone();
                     self.editing_message = Some(m.id);
@@ -1742,7 +1998,7 @@ impl App {
                                 ui::Tone::Normal,
                                 ready,
                             )
-                            .on_hover_text("Прикрепить изображение")
+                            .on_hover_text("Прикрепить файл")
                             .clicked();
 
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1775,11 +2031,14 @@ impl App {
                     });
             });
         if attach {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Изображения", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
-                .pick_file()
-            {
-                if let Err(e) = self.session.as_mut().unwrap().image(&self.channel, path) {
+            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                let session = self.session.as_mut().unwrap();
+                let result = if is_image_path(&path) {
+                    session.image(&self.channel, path)
+                } else {
+                    session.file(&self.channel, path)
+                };
+                if let Err(e) = result {
                     self.error = e.to_string();
                 }
             }
@@ -1810,6 +2069,7 @@ impl App {
         let session = self.session.as_ref().unwrap();
         // 0 — редактировать, 1 — удалить у себя, 2 — удалить у всех.
         let mut action: Option<(uuid::Uuid, u8)> = None;
+        let mut save_existing: Option<(uuid::Uuid, String)> = None;
         egui::ScrollArea::vertical()
             .id_salt(("messages", &channel))
             .stick_to_bottom(true)
@@ -1951,6 +2211,83 @@ impl App {
                                                 .wrap(),
                                             );
                                         }
+                                    } else if let Some(file) = &m.file {
+                                        let own = m.author_key == session.own_key();
+                                        let can_delete_all = own || session.hosting();
+                                        let card = Frame::new()
+                                            .fill(ui::selected(light))
+                                            .corner_radius(8)
+                                            .inner_margin(Margin::symmetric(12, 9))
+                                            .show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 10.0;
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        Vec2::splat(34.0),
+                                                        Sense::hover(),
+                                                    );
+                                                    ui::paint_icon(
+                                                        ui.painter(),
+                                                        ui::Icon::File,
+                                                        rect.shrink(3.0),
+                                                        ui::muted(light),
+                                                        false,
+                                                    );
+                                                    ui.vertical(|ui| {
+                                                        ui.spacing_mut().item_spacing.y = 1.0;
+                                                        ui.label(
+                                                            RichText::new(&file.name)
+                                                                .size(14.0)
+                                                                .strong(),
+                                                        )
+                                                        .on_hover_text(&file.name);
+                                                        ui.label(
+                                                            RichText::new(file_size(file.size))
+                                                                .size(11.5)
+                                                                .color(ui::muted(light)),
+                                                        );
+                                                    });
+                                                    ui.with_layout(
+                                                        Layout::right_to_left(Align::Center),
+                                                        |ui| {
+                                                            if ui::icon_btn_sized(
+                                                                ui,
+                                                                light,
+                                                                ui::Icon::Download,
+                                                                ui::Tone::Normal,
+                                                                false,
+                                                                30.0,
+                                                            )
+                                                            .on_hover_text(
+                                                                "Сохранить на компьютер",
+                                                            )
+                                                            .clicked()
+                                                            {
+                                                                save_existing =
+                                                                    Some((m.id, file.name.clone()));
+                                                            }
+                                                        },
+                                                    );
+                                                });
+                                            })
+                                            .response;
+                                        card.context_menu(|ui| {
+                                            if ui.button("Сохранить на компьютер").clicked() {
+                                                save_existing =
+                                                    Some((m.id, file.name.clone()));
+                                                ui.close_menu();
+                                            }
+                                            ui.separator();
+                                            if ui.button("Удалить у себя").clicked() {
+                                                action = Some((m.id, 1));
+                                                ui.close_menu();
+                                            }
+                                            if can_delete_all
+                                                && ui.button("Удалить у всех").clicked()
+                                            {
+                                                action = Some((m.id, 2));
+                                                ui.close_menu();
+                                            }
+                                        });
                                     } else {
                                         let response = ui.add(
                                             egui::Label::new(RichText::new(&m.text).size(14.5))
@@ -1982,6 +2319,11 @@ impl App {
                         ui.add_space(4.0);
                     });
             });
+        if let Some((id, name)) = save_existing {
+            if let Err(e) = save_file(&self.store, id, &name) {
+                self.error = e.to_string();
+            }
+        }
         if let Some((id, kind)) = action {
             match kind {
                 0 => {
@@ -2681,10 +3023,13 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.tick(ctx);
+        self.dropped_files(ctx);
+        self.drop_hint(ctx);
         if self.editing {
             self.settings_screen(ctx);
             self.member_card(ctx);
             self.image_preview(ctx);
+            self.screen_window(ctx);
             return;
         }
         self.error_bar(ctx);
@@ -2711,6 +3056,7 @@ impl eframe::App for App {
         }
         self.member_card(ctx);
         self.image_preview(ctx);
+        self.screen_window(ctx);
     }
 }
 fn key_string(key: &[u8]) -> String {
@@ -2764,6 +3110,22 @@ impl App {
         }
     }
 }
+fn screen_image(bytes: &[u8]) -> Option<egui::ColorImage> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(1920);
+    limits.max_image_height = Some(1200);
+    limits.max_alloc = Some(32 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode().ok()?.to_rgba8();
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [image.width() as usize, image.height() as usize],
+        image.as_raw(),
+    ))
+}
+
 fn texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -2811,6 +3173,71 @@ fn show_image(
         )
         .on_hover_cursor(egui::CursorIcon::ZoomIn),
     )
+}
+
+fn is_image_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
+            )
+        })
+}
+
+fn file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let size = bytes as f64;
+    if size < KB {
+        format!("{bytes} Б")
+    } else if size < KB * KB {
+        format!("{:.1} КБ", size / KB)
+    } else {
+        format!("{:.1} МБ", size / (KB * KB))
+    }
+}
+
+fn safe_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || "<>:\"/\\|?*".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches('.').trim();
+    if cleaned.is_empty() {
+        return "file".into();
+    }
+    let stem = cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
+            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+    );
+    let cleaned = cleaned.chars().take(120).collect::<String>();
+    if reserved {
+        format!("_{cleaned}")
+    } else {
+        cleaned
+    }
+}
+
+fn save_file(store: &Store, id: uuid::Uuid, name: &str) -> anyhow::Result<()> {
+    let bytes = thodtalk::attachments::load_bytes(store, id)?
+        .ok_or_else(|| anyhow::anyhow!("Файл не найден"))?;
+    if let Some(path) = rfd::FileDialog::new()
+        .set_file_name(safe_file_name(name))
+        .save_file()
+    {
+        std::fs::write(path, bytes)?;
+    }
+    Ok(())
 }
 
 fn save_attachment(store: &Store, id: uuid::Uuid) -> anyhow::Result<()> {

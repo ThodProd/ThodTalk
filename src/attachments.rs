@@ -1,6 +1,9 @@
 use crate::storage::Store;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 pub const MAX_IMAGE: usize = 180_000;
+/// Limit for arbitrary files. The transport caps one packet at 1 MiB, so files
+/// travel as chunks of `FILE_CHUNK` bytes.
+pub const MAX_FILE: usize = 8 * 1024 * 1024;
 pub fn prepare(path: &std::path::Path) -> Result<Vec<u8>> {
     ensure!(
         std::fs::metadata(path)?.len() <= 20 * 1024 * 1024,
@@ -49,4 +52,48 @@ pub fn save(store: &Store, id: uuid::Uuid, bytes: &[u8]) -> Result<()> {
         store.save(&key, &bytes)?;
     }
     Ok(())
+}
+
+/// Read a file of any extension for sending.
+pub fn read_file(path: &std::path::Path) -> Result<(Vec<u8>, String, u64)> {
+    let meta = std::fs::metadata(path).with_context(|| "Файл недоступен")?;
+    ensure!(meta.is_file(), "Это не файл");
+    let size = meta.len();
+    ensure!(
+        size > 0 && size <= MAX_FILE as u64,
+        "Файл должен быть от 1 байта до 8 МБ"
+    );
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Некорректное имя файла")?
+        .to_owned();
+    ensure!(valid_file_name(&name), "Некорректное имя файла");
+    let bytes = std::fs::read(path)?;
+    ensure!(bytes.len() <= MAX_FILE, "Файл больше 8 МБ");
+    Ok((bytes, name, size))
+}
+
+/// A bare file name: no directories, control characters or excessive length.
+pub fn valid_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= 120
+        && !name.chars().any(char::is_control)
+        && !name.contains(['/', '\\'])
+        && name != "."
+        && name != ".."
+}
+
+/// Store arbitrary bytes under the same key as images.
+pub fn save_bytes(store: &Store, id: uuid::Uuid, bytes: &[u8]) -> Result<()> {
+    ensure!(bytes.len() <= MAX_FILE, "Файл больше 8 МБ");
+    let key = format!("image-{id}");
+    if store.load::<Vec<u8>>(&key)?.is_none() {
+        store.save(&key, &bytes)?;
+    }
+    Ok(())
+}
+
+pub fn load_bytes(store: &Store, id: uuid::Uuid) -> Result<Option<Vec<u8>>> {
+    store.load(&format!("image-{id}"))
 }

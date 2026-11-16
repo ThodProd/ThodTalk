@@ -2,6 +2,12 @@ use crate::storage::Store;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Hash)]
+pub struct FileMeta {
+    pub name: String,
+    pub size: u64,
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct Message {
     #[serde(default = "default_channel")]
@@ -13,6 +19,9 @@ pub struct Message {
     pub timestamp_ms: u64,
     #[serde(default)]
     pub image: Option<uuid::Uuid>,
+    /// Any non-image attachment. Stored under the same key as `image`.
+    #[serde(default)]
+    pub file: Option<FileMeta>,
     #[serde(default)]
     pub edited: bool,
 }
@@ -68,7 +77,7 @@ impl History {
             self.messages[index].author_key == author,
             "Можно редактировать только свои сообщения"
         );
-        if self.messages[index].image.is_some() {
+        if self.messages[index].image.is_some() || self.messages[index].file.is_some() {
             return Ok(false);
         }
         let previous = self.messages[index].text.clone();
@@ -118,6 +127,7 @@ mod tests {
             text: "Привет".into(),
             timestamp_ms: 1,
             image: None,
+            file: None,
             edited: false,
         };
         assert!(history.append(&store, message.clone()).unwrap());

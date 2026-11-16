@@ -1,6 +1,6 @@
 use crate::{
     crypto::Identity,
-    history::{History, Message},
+    history::{FileMeta, History, Message},
     internet::{InternetGuest, InternetHost, PairEvent},
     storage::{Profile, Store},
     transport::Connection,
@@ -66,6 +66,26 @@ pub enum Payload {
         #[serde(default)]
         deafened: bool,
     },
+    Screen {
+        channel: String,
+        width: u32,
+        height: u32,
+        #[serde(with = "crate::wire::binary")]
+        data: Vec<u8>,
+    },
+    FileStart {
+        id: uuid::Uuid,
+        channel: String,
+        file_name: String,
+        size: u64,
+        time: u64,
+        name: String,
+    },
+    FileChunk {
+        id: uuid::Uuid,
+        #[serde(with = "crate::wire::binary")]
+        data: Vec<u8>,
+    },
 }
 #[derive(Clone, Serialize, Deserialize, Hash)]
 pub struct Member {
@@ -75,6 +95,24 @@ pub struct Member {
     pub muted: bool,
     #[serde(default)]
     pub deafened: bool,
+}
+const FILE_CHUNK: usize = 150 * 1024;
+struct PendingFile {
+    id: uuid::Uuid,
+    channel: String,
+    file_name: String,
+    data: Vec<u8>,
+    offset: usize,
+}
+struct IncomingFile {
+    author: Vec<u8>,
+    name: String,
+    channel: String,
+    file_name: String,
+    size: usize,
+    time: u64,
+    data: Vec<u8>,
+    last: std::time::Instant,
 }
 enum Link {
     Host(InternetHost),
@@ -95,6 +133,13 @@ pub struct Session {
     pub closed: bool,
     pub profile: Profile,
     pub voice_in: Vec<(Vec<u8>, String, Vec<u8>)>,
+    /// Latest screen frame: author, channel, width, height, JPEG bytes.
+    pub screen_in: Option<(Vec<u8>, String, u32, u32, Vec<u8>)>,
+    screen_rate: BTreeMap<Vec<u8>, std::time::Instant>,
+    file_out: Option<PendingFile>,
+    file_queue: std::collections::VecDeque<PendingFile>,
+    files_in: BTreeMap<uuid::Uuid, IncomingFile>,
+    last_file_sweep: std::time::Instant,
     connections: BTreeMap<u64, LeafNodeIndex>,
     banned: std::collections::BTreeSet<Vec<u8>>,
     last_owner: std::time::Instant,
@@ -144,6 +189,12 @@ impl Session {
             closed: false,
             profile,
             voice_in: Vec::new(),
+            screen_in: None,
+            screen_rate: BTreeMap::new(),
+            file_out: None,
+            file_queue: std::collections::VecDeque::new(),
+            files_in: BTreeMap::new(),
+            last_file_sweep: std::time::Instant::now(),
             connections: BTreeMap::new(),
             banned: Default::default(),
             last_owner: std::time::Instant::now(),
@@ -189,6 +240,12 @@ impl Session {
             closed: false,
             profile,
             voice_in: Vec::new(),
+            screen_in: None,
+            screen_rate: BTreeMap::new(),
+            file_out: None,
+            file_queue: std::collections::VecDeque::new(),
+            files_in: BTreeMap::new(),
+            last_file_sweep: std::time::Instant::now(),
             connections: BTreeMap::new(),
             banned: Default::default(),
             last_owner: std::time::Instant::now(),
@@ -277,6 +334,7 @@ impl Session {
         self.connections.remove(&connection);
         self.members.remove(key);
         self.received_voice.remove(key);
+        self.screen_rate.remove(key);
         Ok(())
     }
     pub fn new_invite(&mut self) {
@@ -338,7 +396,11 @@ impl Session {
         // Persist the sending ratchet before ciphertext becomes visible to the network.
         if !matches!(
             payload,
-            Payload::VoiceFrame { .. } | Payload::Heartbeat { .. } | Payload::Probe { .. }
+            Payload::VoiceFrame { .. }
+                | Payload::Heartbeat { .. }
+                | Payload::Probe { .. }
+                | Payload::Screen { .. }
+                | Payload::FileChunk { .. }
         ) {
             self.identity.save(&self.store)?;
         }
@@ -385,9 +447,106 @@ impl Session {
                 timestamp_ms: time,
                 image: Some(id),
                 edited: false,
+                file: None,
             },
         )?;
         Ok(())
+    }
+    pub fn screen(&mut self, channel: &str, width: u32, height: u32, data: Vec<u8>) -> Result<()> {
+        ensure!(valid_channel(channel), "Неизвестный голосовой канал");
+        ensure!(
+            (2..=4096).contains(&width) && (2..=4096).contains(&height),
+            "Некорректный размер кадра"
+        );
+        ensure!(
+            !data.is_empty() && data.len() <= 170 * 1024,
+            "Кадр экрана слишком большой"
+        );
+        self.send(Payload::Screen {
+            channel: channel.into(),
+            width,
+            height,
+            data,
+        })
+    }
+    /// Share a file of any extension. Chunks are streamed by `pump_file` so a
+    /// large transfer never blocks the network loop or voice packets.
+    pub fn file(&mut self, channel: &str, path: &std::path::Path) -> Result<()> {
+        ensure!(valid_channel(channel), "Неизвестный канал");
+        let (data, file_name, size) = crate::attachments::read_file(path)?;
+        ensure!(
+            self.file_queue.len() < 5,
+            "Слишком много файлов в очереди — дождитесь отправки"
+        );
+        let id = uuid::Uuid::new_v4();
+        crate::attachments::save_bytes(&self.store, id, &data)?;
+        let time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+        self.history.append(
+            &self.store,
+            Message {
+                id,
+                channel: channel.into(),
+                author_key: self.own_key(),
+                display_name: self.profile.name.clone(),
+                text: "Файл".into(),
+                timestamp_ms: time,
+                image: None,
+                file: Some(FileMeta {
+                    name: file_name.clone(),
+                    size,
+                }),
+                edited: false,
+            },
+        )?;
+        self.file_queue.push_back(PendingFile {
+            id,
+            channel: channel.into(),
+            file_name,
+            data,
+            offset: 0,
+        });
+        Ok(())
+    }
+    fn pump_file(&mut self) {
+        if self.file_out.is_none() {
+            let Some(file) = self.file_queue.pop_front() else {
+                return;
+            };
+            let payload = Payload::FileStart {
+                id: file.id,
+                channel: file.channel.clone(),
+                file_name: file.file_name.clone(),
+                size: file.data.len() as u64,
+                time: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                name: self.profile.name.clone(),
+            };
+            if self.send(payload).is_ok() {
+                self.file_out = Some(file);
+            } else {
+                self.file_queue.push_front(file);
+                return;
+            }
+        }
+        let Some(file) = &self.file_out else {
+            return;
+        };
+        let end = (file.offset + FILE_CHUNK).min(file.data.len());
+        let (id, chunk, done) = (
+            file.id,
+            file.data[file.offset..end].to_vec(),
+            end == file.data.len(),
+        );
+        if self.send(Payload::FileChunk { id, data: chunk }).is_ok() {
+            if let Some(file) = &mut self.file_out {
+                file.offset = end;
+                if done {
+                    self.file_out = None;
+                }
+            }
+        }
     }
     pub fn chat(&mut self, channel: &str, text: &str) -> Result<()> {
         ensure!(
@@ -414,6 +573,7 @@ impl Session {
                 image: None,
                 channel: channel.into(),
                 edited: false,
+                file: None,
             },
         )?;
         Ok(())
@@ -435,7 +595,10 @@ impl Session {
             target.author_key == own,
             "Можно редактировать только свои сообщения"
         );
-        ensure!(target.image.is_none(), "Изображение нельзя отредактировать");
+        ensure!(
+            target.image.is_none() && target.file.is_none(),
+            "Вложение нельзя отредактировать"
+        );
         if target.text == text {
             return Ok(());
         }
@@ -453,7 +616,7 @@ impl Session {
         };
         let own = self.own_key();
         let authority = self.hosting() || own == self.owner;
-        let image = target.image;
+        let attachment = (target.image.is_some() || target.file.is_some()).then_some(id);
         if for_everyone {
             ensure!(
                 target.author_key == own || authority,
@@ -463,8 +626,8 @@ impl Session {
         }
         self.history.remove(&self.store, id)?;
         if for_everyone {
-            if let Some(image) = image {
-                let _ = crate::attachments::remove(&self.store, image);
+            if let Some(attachment) = attachment {
+                let _ = crate::attachments::remove(&self.store, attachment);
             }
         }
         Ok(())
@@ -583,6 +746,8 @@ impl Session {
                         Payload::VoiceFrame { .. }
                             | Payload::Heartbeat { .. }
                             | Payload::Probe { .. }
+                            | Payload::Screen { .. }
+                            | Payload::FileChunk { .. }
                     ) {
                         self.identity.save(&self.store)?;
                     }
@@ -631,6 +796,7 @@ impl Session {
                                     timestamp_ms: time,
                                     image: Some(id),
                                     edited: false,
+                                    file: None,
                                 },
                             )?;
                         }
@@ -681,6 +847,7 @@ impl Session {
                                     image: None,
                                     channel,
                                     edited: false,
+                                    file: None,
                                 },
                             )?;
                         }
@@ -692,7 +859,10 @@ impl Session {
                             else {
                                 continue;
                             };
-                            if target.author_key != author || target.image.is_some() {
+                            if target.author_key != author
+                                || target.image.is_some()
+                                || target.file.is_some()
+                            {
                                 continue;
                             }
                             self.history.edit(&self.store, id, &author, &text)?;
@@ -706,10 +876,11 @@ impl Session {
                             if target.author_key != author && author != self.owner {
                                 continue;
                             }
-                            let image = target.image;
+                            let has_attachment =
+                                target.image.is_some() || target.file.is_some();
                             self.history.remove(&self.store, id)?;
-                            if let Some(image) = image {
-                                let _ = crate::attachments::remove(&self.store, image);
+                            if has_attachment {
+                                let _ = crate::attachments::remove(&self.store, id);
                             }
                         }
                         Payload::Voice { .. } => {}
@@ -747,6 +918,103 @@ impl Session {
                                 m.deafened = deafened;
                             }
                         }
+                        Payload::Screen {
+                            channel,
+                            width,
+                            height,
+                            data,
+                        } => {
+                            if !valid_channel(&channel)
+                                || !(2..=4096).contains(&width)
+                                || !(2..=4096).contains(&height)
+                                || data.len() < 4
+                                || data.len() > 170 * 1024
+                                // JPEG magic: anything else is not a frame we can show.
+                                || data[0] != 0xFF
+                                || data[1] != 0xD8
+                            {
+                                continue;
+                            }
+                            if self.screen_rate.get(&author).is_some_and(|last| {
+                                last.elapsed() < std::time::Duration::from_millis(90)
+                            }) {
+                                continue;
+                            }
+                            self.screen_rate.insert(author.clone(), std::time::Instant::now());
+                            self.screen_in = Some((author, channel, width, height, data));
+                        }
+                        Payload::FileStart {
+                            id,
+                            channel,
+                            file_name,
+                            size,
+                            time,
+                            name,
+                        } => {
+                            if !valid_channel(&channel)
+                                || size == 0
+                                || size > crate::attachments::MAX_FILE as u64
+                                || !crate::attachments::valid_file_name(&file_name)
+                                || name.trim().is_empty()
+                                || name.chars().count() > 40
+                                || name.chars().any(char::is_control)
+                                || self.files_in.contains_key(&id)
+                                || self.files_in.len() >= 8
+                            {
+                                continue;
+                            }
+                            self.files_in.insert(
+                                id,
+                                IncomingFile {
+                                    author,
+                                    name,
+                                    channel,
+                                    file_name,
+                                    size: size as usize,
+                                    time,
+                                    data: Vec::with_capacity(size as usize),
+                                    last: std::time::Instant::now(),
+                                },
+                            );
+                        }
+                        Payload::FileChunk { id, data } => {
+                            if data.is_empty() || data.len() > FILE_CHUNK {
+                                continue;
+                            }
+                            let Some(file) = self.files_in.get_mut(&id) else {
+                                continue;
+                            };
+                            if file.author != author || file.data.len() + data.len() > file.size {
+                                self.files_in.remove(&id);
+                                continue;
+                            }
+                            file.data.extend_from_slice(&data);
+                            file.last = std::time::Instant::now();
+                            if file.data.len() < file.size {
+                                continue;
+                            }
+                            let file = self.files_in.remove(&id).unwrap();
+                            if crate::attachments::save_bytes(&self.store, id, &file.data).is_err() {
+                                continue;
+                            }
+                            let _ = self.history.append(
+                                &self.store,
+                                Message {
+                                    id,
+                                    author_key: file.author,
+                                    display_name: file.name,
+                                    channel: file.channel,
+                                    text: "Файл".into(),
+                                    timestamp_ms: file.time,
+                                    image: None,
+                                    file: Some(FileMeta {
+                                        name: file.file_name,
+                                        size: file.size as u64,
+                                    }),
+                                    edited: false,
+                                },
+                            );
+                        }
                     }
                 }
                 Packet::Disconnect { connection } if self.hosting() => {
@@ -755,6 +1023,7 @@ impl Session {
                         if let Some(member) = group.member_at(index) {
                             self.members.remove(&member.signature_key);
                             self.received_voice.remove(&member.signature_key);
+                            self.screen_rate.remove(&member.signature_key);
                         }
                         let (commit, _, _) = group.remove_members(
                             &self.identity.provider,
@@ -772,6 +1041,12 @@ impl Session {
                 _ => anyhow::bail!("Неожиданный пакет протокола"),
             }
         }
+        if self.last_file_sweep.elapsed() > std::time::Duration::from_secs(10) {
+            self.last_file_sweep = std::time::Instant::now();
+            self.files_in
+                .retain(|_, file| file.last.elapsed() < std::time::Duration::from_secs(120));
+        }
+        self.pump_file();
         Ok(())
     }
 }
@@ -804,6 +1079,103 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    #[test]
+    fn file_transfer_reaches_guest_in_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("guest");
+        let mut host = Session::host_with(
+            Store::open(dir.path().join("host")).unwrap(),
+            Profile {
+                name: "Хозяин".into(),
+                ..Default::default()
+            },
+            InternetHost::local,
+        )
+        .unwrap();
+        let guest = |h: &Session| {
+            let Link::Host(network) = &h.link else {
+                unreachable!()
+            };
+            Session::from_guest(
+                Store::open(root.clone()).unwrap(),
+                Profile {
+                    name: "Друг".into(),
+                    ..Default::default()
+                },
+                network.local_guest().unwrap(),
+            )
+            .unwrap()
+        };
+        let mut guests = vec![guest(&host)];
+        pump(&mut host, &mut guests, |h, gs| {
+            h.members.len() == 2 && gs[0].ready()
+        });
+
+        let payload: Vec<u8> = (0..600_000u32).map(|i| (i % 251) as u8).collect();
+        let path = dir.path().join("notes.bin");
+        std::fs::write(&path, &payload).unwrap();
+        host.file("Общий", &path).unwrap();
+        pump(&mut host, &mut guests, |_, gs| {
+            gs[0].history.messages.iter().any(|m| m.file.is_some())
+        });
+        let message = guests[0]
+            .history
+            .messages
+            .iter()
+            .find(|m| m.file.is_some())
+            .unwrap();
+        let meta = message.file.as_ref().unwrap();
+        assert_eq!(meta.name, "notes.bin");
+        assert_eq!(meta.size, payload.len() as u64);
+        let saved = crate::attachments::load_bytes(&guests[0].store, message.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved, payload);
+    }
+
+    #[test]
+    fn screen_frame_reaches_guest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("guest");
+        let mut host = Session::host_with(
+            Store::open(dir.path().join("host")).unwrap(),
+            Profile {
+                name: "Хозяин".into(),
+                ..Default::default()
+            },
+            InternetHost::local,
+        )
+        .unwrap();
+        let guest = |h: &Session| {
+            let Link::Host(network) = &h.link else {
+                unreachable!()
+            };
+            Session::from_guest(
+                Store::open(root.clone()).unwrap(),
+                Profile {
+                    name: "Друг".into(),
+                    ..Default::default()
+                },
+                network.local_guest().unwrap(),
+            )
+            .unwrap()
+        };
+        let mut guests = vec![guest(&host)];
+        pump(&mut host, &mut guests, |h, gs| {
+            h.members.len() == 2 && gs[0].ready()
+        });
+
+        let frame = vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4];
+        host.screen("Общий", 320, 180, frame.clone()).unwrap();
+        pump(&mut host, &mut guests, |_, gs| gs[0].screen_in.is_some());
+        let (author, channel, width, height, data) = guests[0].screen_in.clone().unwrap();
+        assert_eq!(author, host.own_key());
+        assert_eq!(channel, "Общий");
+        assert_eq!((width, height), (320, 180));
+        assert_eq!(data, frame);
+        assert!(host.screen("Общий", 0, 10, frame).is_err());
+    }
+
     #[test]
     fn ban_rejects_same_identity_and_owner_exit_never_confirms_pending_join() {
         let dir = tempfile::tempdir().unwrap();

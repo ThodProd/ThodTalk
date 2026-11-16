@@ -61,7 +61,10 @@ fn internet_builder() -> Result<iroh::endpoint::Builder> {
         builder
     };
     let relays = relay_candidates()?;
-    let relay_map = iroh::RelayMap::from_iter([relays[0].clone()]);
+    // Keep every candidate configured. The invitation contains the relay that
+    // the host actually verified; guests must be able to use a fallback relay
+    // too, instead of being limited to the first one in this list.
+    let relay_map = iroh::RelayMap::from_iter(relays);
     Ok(builder.relay_mode(iroh::RelayMode::Custom(relay_map)))
 }
 fn relay_candidates() -> Result<Vec<iroh::RelayUrl>> {

@@ -230,54 +230,15 @@ impl InternetHost {
         });
         let (tx, rx) = mpsc::channel();
         let endpoint = self.endpoint.clone();
-        let token = self.token;
+        let self_token = self.token;
         self.runtime.spawn(async move {
-            // Include the actual route so a freshly created server does not depend
-            // on DNS/PKARR publication having propagated before the first join.
+            // Wait until iroh has selected its normal relay/direct route before
+            // publishing the invitation. Never downgrade an internet invite to
+            // a local-only address just because a probe was slow.
             let _ = tokio::time::timeout(Duration::from_secs(5), endpoint.online()).await;
-            let candidates = relay_candidates().unwrap_or_default();
-            let mut verified = false;
-            for index in 0..candidates.len() {
-                let Some(relay) = endpoint.addr().relay_urls().next().cloned() else {
-                    break;
-                };
-                if relay_probe(&endpoint, relay.clone(), token).await {
-                    verified = true;
-                    break;
-                }
-                if let Some(next) = candidates.get(index + 1) {
-                    endpoint
-                        .insert_relay(
-                            next.clone(),
-                            Arc::new(iroh::RelayConfig::from(next.clone())),
-                        )
-                        .await;
-                }
-                endpoint.remove_relay(&relay).await;
-                let _ = tokio::time::timeout(Duration::from_secs(3), async {
-                    loop {
-                        if endpoint.addr().relay_urls().any(|url| url != &relay) {
-                            endpoint.online().await;
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                })
-                .await;
-            }
-            let address = if verified {
-                endpoint.addr()
-            } else {
-                // Relay removal is asynchronous; never publish a stale failed route.
-                endpoint
-                    .addr()
-                    .ip_addrs()
-                    .fold(EndpointAddr::new(endpoint.id()), |addr, ip| {
-                        addr.with_ip_addr(*ip)
-                    })
-            };
-            let code = encode_address_code(&address, &token);
-            let event = if verified {
+            let address = endpoint.addr();
+            let code = encode_address_code(&address, &self_token);
+            let event = if address.relay_urls().next().is_some() {
                 PairEvent::Code(code)
             } else {
                 PairEvent::LocalCode(code)

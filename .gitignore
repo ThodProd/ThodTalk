@@ -1,6 +1,8 @@
 /target/
 /dist/
 /test-data/
+/Release_v0.3.2/
+ThodTalk_v*.zip
 *.log
 .env
 

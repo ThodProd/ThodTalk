@@ -31,6 +31,14 @@ enum Request {
         channel: String,
         text: String,
     },
+    Edit {
+        id: uuid::Uuid,
+        text: String,
+    },
+    Delete {
+        id: uuid::Uuid,
+        everywhere: bool,
+    },
     Payload(Payload),
     Profile(Profile),
     Image {
@@ -58,6 +66,7 @@ struct Snapshot {
     status: String,
     code: String,
     closed: bool,
+    ping_ms: Option<u32>,
 }
 pub struct ViewHistory {
     pub messages: Vec<Message>,
@@ -74,6 +83,7 @@ pub struct SessionProxy {
     pub status: String,
     pub code: String,
     pub closed: bool,
+    pub ping_ms: Option<u32>,
     pub invite: Option<()>,
     pub voice_in: Vec<(Vec<u8>, String, Vec<u8>)>,
 }
@@ -182,6 +192,7 @@ impl SessionProxy {
             status: String::new(),
             code: String::new(),
             closed: false,
+            ping_ms: None,
             invite: None,
             voice_in: Vec::new(),
         };
@@ -225,6 +236,7 @@ impl SessionProxy {
                 self.status = s.status;
                 self.code = s.code;
                 self.closed = s.closed;
+                self.ping_ms = s.ping_ms;
                 self.invite = self.hosting.then_some(());
             }
             Event::Voice(frames) => {
@@ -284,6 +296,18 @@ impl SessionProxy {
             text: text.into(),
         })
     }
+    pub fn edit_chat(&mut self, id: uuid::Uuid, text: &str) -> Result<()> {
+        self.request(Request::Edit {
+            id,
+            text: text.into(),
+        })
+    }
+    pub fn delete_chat(&mut self, id: uuid::Uuid, for_everyone: bool) -> Result<()> {
+        self.request(Request::Delete {
+            id,
+            everywhere: for_everyone,
+        })
+    }
     pub fn update_profile(&mut self, profile: Profile) -> Result<()> {
         self.request(Request::Profile(profile))
     }
@@ -320,15 +344,26 @@ fn snapshot(session: &Session) -> Snapshot {
         status: session.status.clone(),
         code: session.code.clone(),
         closed: session.closed,
+        ping_ms: session.ping_ms,
     }
 }
 fn revision(session: &Session) -> u64 {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     session.members.hash(&mut hash);
     session.history.messages.len().hash(&mut hash);
+    // Track the visible window so edits and deletions refresh the UI.
+    for message in session.history.messages.iter().rev().take(300) {
+        message.id.hash(&mut hash);
+        message.text.hash(&mut hash);
+        message.channel.hash(&mut hash);
+        message.edited.hash(&mut hash);
+        message.timestamp_ms.hash(&mut hash);
+        message.image.hash(&mut hash);
+    }
     session.status.hash(&mut hash);
     session.code.hash(&mut hash);
     session.closed.hash(&mut hash);
+    session.ping_ms.hash(&mut hash);
     session.ready().hash(&mut hash);
     hash.finish()
 }
@@ -378,6 +413,8 @@ pub fn run() -> Result<()> {
             };
             let result = match request {
                 Request::Chat { channel, text } => session.chat(&channel, &text),
+                Request::Edit { id, text } => session.edit_chat(id, &text),
+                Request::Delete { id, everywhere } => session.delete_chat(id, everywhere),
                 Request::Payload(payload) => session.send(payload),
                 Request::Profile(profile) => session.update_profile(profile),
                 Request::Image { channel, path } => session.image(&channel, &path),

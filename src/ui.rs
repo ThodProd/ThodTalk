@@ -61,6 +61,16 @@ pub fn danger_bg(light: bool) -> Color32 {
 pub fn success(light: bool) -> Color32 {
     pick(light, (30, 150, 80), (59, 196, 120))
 }
+/// Мягкая подсветка задержки: обычная, повышенная, высокая.
+pub fn ping(light: bool, ms: u32) -> Color32 {
+    if ms <= 80 {
+        muted(light)
+    } else if ms <= 160 {
+        pick(light, (168, 122, 20), (214, 178, 92))
+    } else {
+        danger(light)
+    }
+}
 fn button_bg(light: bool) -> Color32 {
     pick(light, (225, 227, 231), (78, 80, 88))
 }
@@ -592,35 +602,6 @@ pub fn composer_send(ui: &mut Ui, light: bool, enabled: bool) -> Response {
         Icon::Send,
         Rect::from_center_size(rect.center(), Vec2::splat(20.0)),
         color,
-        false,
-    );
-    if enabled {
-        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-    } else {
-        resp
-    }
-}
-
-/// Круглая синяя кнопка «отправить».
-pub fn send_btn(ui: &mut Ui, light: bool, enabled: bool) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
-    if enabled {
-        let fill = if resp.hovered() {
-            BLUE.gamma_multiply(0.88)
-        } else {
-            BLUE
-        };
-        ui.painter().circle_filled(rect.center(), 17.0, fill);
-    }
-    paint_icon(
-        ui.painter(),
-        Icon::Send,
-        Rect::from_center_size(rect.center(), Vec2::splat(18.0)),
-        if enabled {
-            Color32::WHITE
-        } else {
-            muted(light).gamma_multiply(0.7)
-        },
         false,
     );
     if enabled {

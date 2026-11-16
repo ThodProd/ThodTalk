@@ -42,6 +42,8 @@ struct App {
     connecting: Option<mpsc::Receiver<anyhow::Result<Session>>>,
     code: String,
     draft: String,
+    editing_message: Option<uuid::Uuid>,
+    focus_composer: bool,
     channel: String,
     audio: Option<Audio>,
     voice_channel: Option<String>,
@@ -104,6 +106,8 @@ impl App {
             connecting: None,
             code: String::new(),
             draft: String::new(),
+            editing_message: None,
+            focus_composer: false,
             channel: "Общий".into(),
             audio: None,
             voice_channel: None,
@@ -223,6 +227,7 @@ impl App {
             let _ = session.send(Payload::VoiceState {
                 channel: None,
                 muted: true,
+                deafened: self.deafened,
             });
         }
     }
@@ -231,7 +236,12 @@ impl App {
             self.error = "Разрешите микрофон в профиле".into();
             return;
         }
-        match Audio::start(&self.input_device, &self.output_device) {
+        match Audio::start_with_opts(
+            &self.input_device, 
+            &self.output_device,
+            self.profile.ffmpeg_noise_suppression,
+            self.profile.voice_enhancement,
+        ) {
             Ok(audio) => {
                 self.sound(thodtalk::sounds::Sound::Join);
                 self.audio = Some(audio);
@@ -240,10 +250,18 @@ impl App {
                     let _ = session.send(Payload::VoiceState {
                         channel: Some(channel.to_string()),
                         muted: self.muted,
+                        deafened: self.deafened,
                     });
                 }
             }
             Err(e) => self.error = format!("Не удалось включить голос: {e}"),
+        }
+    }
+    fn toggle_user_mute(&mut self, key: Vec<u8>) {
+        if self.profile.muted_users.contains(&key) {
+            self.profile.muted_users.remove(&key);
+        } else {
+            self.profile.muted_users.insert(key);
         }
     }
     fn tick(&mut self, ctx: &egui::Context) {
@@ -734,6 +752,24 @@ impl App {
                             .size(12.0)
                             .color(ui::muted(light)),
                     );
+                    let ping = self.session.as_ref().and_then(|s| s.ping_ms);
+                    match ping {
+                        Some(ms) => {
+                            ui.label(
+                                RichText::new(format!("· {ms} мс"))
+                                    .size(12.0)
+                                    .color(ui::ping(light, ms)),
+                            )
+                            .on_hover_text("Задержка до сервера");
+                        }
+                        None => {
+                            ui.label(
+                                RichText::new("· измеряем…")
+                                    .size(12.0)
+                                    .color(ui::muted(light)),
+                            );
+                        }
+                    }
                 });
             });
             child.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -937,14 +973,22 @@ impl App {
                 (44.0, 32.0, 0.0)
             };
             let in_voice = member.voice.is_some();
-            let show_icon = member.muted && in_voice || (!compact && in_voice);
+            let show_icon = (member.muted || member.deafened) && in_voice
+                || (!compact && in_voice);
+            let icon_width = if member.deafened {
+                44.0
+            } else if show_icon {
+                26.0
+            } else {
+                4.0
+            };
             let textures = &self.member_textures;
             let response = ui::row(
                 ui,
                 light,
                 height,
                 indent,
-                if show_icon { 26.0 } else { 4.0 },
+                icon_width,
                 |ui| {
                     let mut avatar = ui::Avatar::new(
                         textures.get(&key).map(|(_, t)| t),
@@ -972,7 +1016,30 @@ impl App {
                     );
                 },
             );
-            if show_icon {
+            if member.deafened {
+                // Полностью выключен звук: и микрофон, и наушники перечёркнуты.
+                let color = ui::danger(light);
+                ui::paint_icon(
+                    ui.painter(),
+                    ui::Icon::Headphones,
+                    Rect::from_center_size(
+                        pos2(response.rect.right() - 14.0, response.rect.center().y),
+                        Vec2::splat(15.0),
+                    ),
+                    color,
+                    true,
+                );
+                ui::paint_icon(
+                    ui.painter(),
+                    ui::Icon::Mic,
+                    Rect::from_center_size(
+                        pos2(response.rect.right() - 32.0, response.rect.center().y),
+                        Vec2::splat(15.0),
+                    ),
+                    color,
+                    true,
+                );
+            } else if show_icon {
                 let (icon, color, slashed) = if member.muted {
                     (ui::Icon::Mic, ui::danger(light), true)
                 } else {
@@ -1018,11 +1085,7 @@ impl App {
                         })
                         .clicked()
                     {
-                        if is_muted {
-                            self.profile.muted_users.remove(&key);
-                        } else {
-                            self.profile.muted_users.insert(key.clone());
-                        }
+                        self.toggle_user_mute(key.clone());
                         let _ = self.store.save("profile", &self.profile);
                         ui.close_menu();
                     }
@@ -1268,11 +1331,7 @@ impl App {
                         },
                     );
                     if is_globally_muted != mute_before_global {
-                        if is_globally_muted {
-                            self.profile.muted_users.insert(key.clone());
-                        } else {
-                            self.profile.muted_users.remove(&key);
-                        }
+                        self.toggle_user_mute(key.clone());
                         let _ = self.store.save("profile", &self.profile);
                     }
 
@@ -1382,9 +1441,9 @@ impl App {
 
         // Mouse wheel zoom
         ctx.input(|i| {
-            if i.scroll_delta.y > 0.0 {
+            if i.raw_scroll_delta.y > 0.0 {
                 self.preview_zoom = (self.preview_zoom * 1.2).min(8.0);
-            } else if i.scroll_delta.y < 0.0 {
+            } else if i.raw_scroll_delta.y < 0.0 {
                 self.preview_zoom = (self.preview_zoom / 1.2).max(0.5);
             }
         });
@@ -1603,9 +1662,60 @@ impl App {
         // Важно: ID текстового поля не должен совпадать с ID панели "composer",
         // иначе egui хранит фокус и состояние панели в одной ячейке памяти.
         let composer_id = egui::Id::new("composer-input");
-        let shortcut = ctx.memory(|m| m.has_focus(composer_id))
+        if std::mem::take(&mut self.focus_composer) {
+            ctx.memory_mut(|m| m.request_focus(composer_id));
+        }
+        let focused = ctx.memory(|m| m.has_focus(composer_id));
+        let shortcut = focused
             && ctx.input(|i| !i.modifiers.shift && !i.modifiers.alt)
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        // Стрелка вверх в пустом поле — редактировать своё последнее сообщение.
+        let edit_last = focused
+            && self.draft.is_empty()
+            && ctx.input(|i| i.modifiers == egui::Modifiers::NONE)
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp));
+        if edit_last {
+            let channel = self.channel.clone();
+            if let Some(session) = &self.session {
+                let own = session.own_key();
+                if let Some(m) = session
+                    .history
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.channel == channel && m.author_key == own && m.image.is_none())
+                {
+                    self.draft = m.text.clone();
+                    self.editing_message = Some(m.id);
+                    self.focus_composer = true;
+                }
+            }
+        }
+        let cancel_edit = focused
+            && self.editing_message.is_some()
+            && ctx.input(|i| i.modifiers == egui::Modifiers::NONE)
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if cancel_edit {
+            self.editing_message = None;
+            self.draft.clear();
+        }
+        // Если сообщение исчезло (удалено или сменился канал) — сбрасываем режим правки.
+        if let Some(id) = self.editing_message {
+            let still_there = self.session.as_ref().is_some_and(|s| {
+                s.history
+                    .messages
+                    .iter()
+                    .any(|m| m.id == id && m.channel == self.channel)
+            });
+            if !still_there {
+                self.editing_message = None;
+                self.draft.clear();
+            }
+        }
+        let hint = match self.editing_message {
+            Some(_) => "Редактирование сообщения · Enter — сохранить, Esc — отмена".to_string(),
+            None => format!("Написать в #{}", self.channel),
+        };
         let mut send = false;
         let mut attach = false;
         egui::TopBottomPanel::bottom("composer-panel")
@@ -1638,7 +1748,11 @@ impl App {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 let can_send = ready && !self.draft.trim().is_empty();
                                 let clicked = ui::composer_send(ui, light, can_send)
-                                    .on_hover_text("Отправить · Enter")
+                                    .on_hover_text(if self.editing_message.is_some() {
+                                        "Сохранить изменения · Enter"
+                                    } else {
+                                        "Отправить · Enter"
+                                    })
                                     .clicked();
 
                                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
@@ -1648,10 +1762,7 @@ impl App {
                                             .id(composer_id)
                                             .frame(false)
                                             .desired_rows(1)
-                                            .hint_text(ui::hint(
-                                                format!("Написать в #{}", self.channel),
-                                                light,
-                                            ))
+                                            .hint_text(ui::hint(hint, light))
                                             .char_limit(16000)
                                             .margin(vec2(4.0, 10.0)),
                                     );
@@ -1674,15 +1785,18 @@ impl App {
             }
         }
         if send && ready && !self.draft.trim().is_empty() {
-            match self
-                .session
-                .as_mut()
-                .unwrap()
-                .chat(&self.channel, &self.draft)
-            {
+            let session = self.session.as_mut().unwrap();
+            let result = match self.editing_message {
+                Some(id) => session.edit_chat(id, &self.draft),
+                None => session.chat(&self.channel, &self.draft),
+            };
+            match result {
                 Ok(()) => {
+                    let edited = self.editing_message.take().is_some();
                     self.draft.clear();
-                    self.sound(thodtalk::sounds::Sound::Sent);
+                    if !edited {
+                        self.sound(thodtalk::sounds::Sound::Sent);
+                    }
                     ctx.memory_mut(|m| m.request_focus(composer_id));
                 }
                 Err(e) => self.error = e.to_string(),
@@ -1694,6 +1808,8 @@ impl App {
         let light = self.profile.light_theme;
         let channel = self.channel.clone();
         let session = self.session.as_ref().unwrap();
+        // 0 — редактировать, 1 — удалить у себя, 2 — удалить у всех.
+        let mut action: Option<(uuid::Uuid, u8)> = None;
         egui::ScrollArea::vertical()
             .id_salt(("messages", &channel))
             .stick_to_bottom(true)
@@ -1782,6 +1898,14 @@ impl App {
                                                 .color(ui::muted(light)),
                                             )
                                             .on_hover_text("Время по UTC");
+                                            if m.edited {
+                                                ui.label(
+                                                    RichText::new("изменено")
+                                                        .size(11.5)
+                                                        .italics()
+                                                        .color(ui::muted(light)),
+                                                );
+                                            }
                                         });
                                     }
                                     if let Some(id) = m.image {
@@ -1794,6 +1918,8 @@ impl App {
                                             if response.clicked() {
                                                 self.preview_image = Some(id);
                                             }
+                                            let own = m.author_key == session.own_key();
+                                            let can_delete_all = own || session.hosting();
                                             response.context_menu(|ui| {
                                                 if ui.button("Сохранить на компьютер").clicked() {
                                                     if let Err(e) =
@@ -1801,6 +1927,17 @@ impl App {
                                                     {
                                                         self.error = e.to_string();
                                                     }
+                                                    ui.close_menu();
+                                                }
+                                                ui.separator();
+                                                if ui.button("Удалить у себя").clicked() {
+                                                    action = Some((m.id, 1));
+                                                    ui.close_menu();
+                                                }
+                                                if can_delete_all
+                                                    && ui.button("Удалить у всех").clicked()
+                                                {
+                                                    action = Some((m.id, 2));
                                                     ui.close_menu();
                                                 }
                                             });
@@ -1815,10 +1952,29 @@ impl App {
                                             );
                                         }
                                     } else {
-                                        ui.add(
+                                        let response = ui.add(
                                             egui::Label::new(RichText::new(&m.text).size(14.5))
-                                                .wrap(),
+                                                .wrap()
+                                                .sense(Sense::click()),
                                         );
+                                        let own = m.author_key == session.own_key();
+                                        let can_delete_all = own || session.hosting();
+                                        response.context_menu(|ui| {
+                                            if own && ui.button("Редактировать").clicked() {
+                                                action = Some((m.id, 0));
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("Удалить у себя").clicked() {
+                                                action = Some((m.id, 1));
+                                                ui.close_menu();
+                                            }
+                                            if can_delete_all
+                                                && ui.button("Удалить у всех").clicked()
+                                            {
+                                                action = Some((m.id, 2));
+                                                ui.close_menu();
+                                            }
+                                        });
                                     }
                                 });
                             });
@@ -1826,6 +1982,33 @@ impl App {
                         ui.add_space(4.0);
                     });
             });
+        if let Some((id, kind)) = action {
+            match kind {
+                0 => {
+                    if let Some(session) = &self.session {
+                        if let Some(m) = session.history.messages.iter().find(|m| m.id == id) {
+                            self.draft = m.text.clone();
+                            self.editing_message = Some(id);
+                            self.focus_composer = true;
+                        }
+                    }
+                }
+                1 => {
+                    if let Some(session) = &mut self.session {
+                        if let Err(e) = session.delete_chat(id, false) {
+                            self.error = e.to_string();
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(session) = &mut self.session {
+                        if let Err(e) = session.delete_chat(id, true) {
+                            self.error = e.to_string();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ───────────────────────── Главная и архив ─────────────────────────
@@ -1883,8 +2066,9 @@ impl App {
                             );
                         }
                         // Quick join last server
-                        if let Some(ref last_code) = self.profile.last_server_code {
+                        if let Some(last_code) = self.profile.last_server_code.clone() {
                             if !last_code.is_empty() {
+                                let code_to_join = last_code.clone();
                                 ui::card(ui, light, |ui| {
                                     ui.label(ui::heading("Быстрое подключение", 17.0));
                                     ui.label(
@@ -1893,7 +2077,7 @@ impl App {
                                     );
                                     ui.add_space(6.0);
                                     if ui.add_enabled(enabled, ui::primary("Присоединиться")).clicked() {
-                                        self.code = last_code.clone();
+                                        self.code = code_to_join;
                                         self.connect(false);
                                     }
                                 });
@@ -2573,6 +2757,7 @@ impl App {
             if let Err(e) = session.send(Payload::VoiceState {
                 channel: self.voice_channel.clone(),
                 muted: self.muted || self.deafened,
+                deafened: self.deafened,
             }) {
                 self.error = e.to_string();
             }

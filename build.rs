@@ -39,5 +39,11 @@ fn main() {
             .set("FileDescription", "ThodTalk — общение с друзьями")
             .compile()
             .unwrap();
+        // GNU ld drops unreferenced members of `libresource.a`, so the icon
+        // silently disappears. Link the resource object itself as well.
+        let object = out.join("resource.o");
+        if object.exists() {
+            println!("cargo:rustc-link-arg={}", object.display());
+        }
     }
 }

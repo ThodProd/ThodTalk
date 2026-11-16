@@ -43,6 +43,13 @@ pub enum Payload {
         time: u64,
         name: String,
     },
+    ChatEdit {
+        id: uuid::Uuid,
+        text: String,
+    },
+    ChatDelete {
+        id: uuid::Uuid,
+    },
     VoiceFrame {
         channel: String,
         #[serde(with = "crate::wire::binary")]
@@ -56,6 +63,8 @@ pub enum Payload {
     VoiceState {
         channel: Option<String>,
         muted: bool,
+        #[serde(default)]
+        deafened: bool,
     },
 }
 #[derive(Clone, Serialize, Deserialize, Hash)]
@@ -64,6 +73,8 @@ pub struct Member {
     pub avatar: Vec<u8>,
     pub voice: Option<String>,
     pub muted: bool,
+    #[serde(default)]
+    pub deafened: bool,
 }
 enum Link {
     Host(InternetHost),
@@ -88,6 +99,8 @@ pub struct Session {
     banned: std::collections::BTreeSet<Vec<u8>>,
     last_owner: std::time::Instant,
     last_probe: std::time::Instant,
+    probe_sent: Option<std::time::Instant>,
+    pub ping_ms: Option<u32>,
     nonce: u64,
     confirmed: bool,
     voice_sequence: u64,
@@ -135,6 +148,8 @@ impl Session {
             banned: Default::default(),
             last_owner: std::time::Instant::now(),
             last_probe: std::time::Instant::now(),
+            probe_sent: None,
+            ping_ms: Some(0),
             nonce: u64::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap()),
             confirmed: false,
             voice_sequence: 0,
@@ -178,6 +193,8 @@ impl Session {
             banned: Default::default(),
             last_owner: std::time::Instant::now(),
             last_probe: std::time::Instant::now(),
+            probe_sent: None,
+            ping_ms: None,
             nonce: u64::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap()),
             confirmed: false,
             voice_sequence: 0,
@@ -218,10 +235,9 @@ impl Session {
         ensure!(self.hosting(), "Только хозяин может выключить сервер");
         self.set_closed(true);
         // Send goodbye message to all members
-        for key in self.members.keys() {
-            if key != &self.owner {
-                let _ = self.kick(key);
-            }
+        let keys_to_kick: Vec<_> = self.members.keys().filter(|k| *k != &self.owner).cloned().collect();
+        for key in keys_to_kick {
+            let _ = self.kick(&key);
         }
         self.status = "Сервер завершает работу".into();
         Ok(())
@@ -278,6 +294,7 @@ impl Session {
             avatar: Vec::new(),
             voice: None,
             muted: false,
+            deafened: false,
         });
         member.name = self.profile.name.clone();
         member.avatar = self.profile.avatar.clone();
@@ -297,6 +314,7 @@ impl Session {
             self.send(Payload::VoiceState {
                 channel: member.voice,
                 muted: member.muted,
+                deafened: member.deafened,
             })?;
         }
         Ok(())
@@ -330,10 +348,16 @@ impl Session {
             } else {
                 Packet::Content { data }
             })?;
-        if let Payload::VoiceState { channel, muted } = payload {
+        if let Payload::VoiceState {
+            channel,
+            muted,
+            deafened,
+        } = payload
+        {
             if let Some(member) = self.members.get_mut(&self.identity.public_key()) {
                 member.voice = channel;
                 member.muted = muted;
+                member.deafened = deafened;
             }
         }
         Ok(())
@@ -360,6 +384,7 @@ impl Session {
                 text: "Изображение".into(),
                 timestamp_ms: time,
                 image: Some(id),
+                edited: false,
             },
         )?;
         Ok(())
@@ -388,8 +413,60 @@ impl Session {
                 timestamp_ms: time,
                 image: None,
                 channel: channel.into(),
+                edited: false,
             },
         )?;
+        Ok(())
+    }
+    /// Edit one of the local user's own messages and broadcast the change.
+    pub fn edit_chat(&mut self, id: uuid::Uuid, text: &str) -> Result<()> {
+        ensure!(
+            text.len() <= 16 * 1024 && !text.trim().is_empty(),
+            "Сообщение пустое или слишком большое"
+        );
+        let own = self.own_key();
+        let target = self
+            .history
+            .messages
+            .iter()
+            .find(|m| m.id == id)
+            .context("Сообщение не найдено")?;
+        ensure!(
+            target.author_key == own,
+            "Можно редактировать только свои сообщения"
+        );
+        ensure!(target.image.is_none(), "Изображение нельзя отредактировать");
+        if target.text == text {
+            return Ok(());
+        }
+        self.send(Payload::ChatEdit {
+            id,
+            text: text.into(),
+        })?;
+        self.history.edit(&self.store, id, &own, text)?;
+        Ok(())
+    }
+    /// Delete a message locally, or for everyone when the author or the owner asks.
+    pub fn delete_chat(&mut self, id: uuid::Uuid, for_everyone: bool) -> Result<()> {
+        let Some(target) = self.history.messages.iter().find(|m| m.id == id) else {
+            return Ok(());
+        };
+        let own = self.own_key();
+        let authority = self.hosting() || own == self.owner;
+        let image = target.image;
+        if for_everyone {
+            ensure!(
+                target.author_key == own || authority,
+                "Удалять чужие сообщения может только владелец сервера"
+            );
+            self.send(Payload::ChatDelete { id })?;
+        }
+        self.history.remove(&self.store, id)?;
+        if for_everyone {
+            if let Some(image) = image {
+                let _ = crate::attachments::remove(&self.store, image);
+            }
+        }
         Ok(())
     }
     pub fn poll(&mut self) -> Result<()> {
@@ -400,6 +477,7 @@ impl Session {
             );
             if self.group.is_some() && self.last_probe.elapsed().as_secs() >= 3 {
                 self.send(Payload::Probe { nonce: self.nonce })?;
+                self.probe_sent = Some(std::time::Instant::now());
                 self.last_probe = std::time::Instant::now();
             }
         }
@@ -519,6 +597,11 @@ impl Session {
                                 self.last_owner = std::time::Instant::now();
                                 self.confirmed = true;
                                 self.status = "Подключено · сквозное шифрование MLS".into();
+                                if let Some(sent) = self.probe_sent.take() {
+                                    self.ping_ms = Some(
+                                        sent.elapsed().as_millis().min(u32::MAX as u128) as u32,
+                                    );
+                                }
                             }
                         }
                         Payload::Image {
@@ -547,6 +630,7 @@ impl Session {
                                     text: "Изображение".into(),
                                     timestamp_ms: time,
                                     image: Some(id),
+                                    edited: false,
                                 },
                             )?;
                         }
@@ -566,6 +650,7 @@ impl Session {
                                 avatar: Vec::new(),
                                 voice: None,
                                 muted: false,
+                                deafened: false,
                             });
                             entry.name = name;
                             entry.avatar = avatar;
@@ -595,8 +680,37 @@ impl Session {
                                     timestamp_ms: time,
                                     image: None,
                                     channel,
+                                    edited: false,
                                 },
                             )?;
+                        }
+                        Payload::ChatEdit { id, text } => {
+                            if text.len() > 16 * 1024 || text.trim().is_empty() {
+                                continue;
+                            }
+                            let Some(target) = self.history.messages.iter().find(|m| m.id == id)
+                            else {
+                                continue;
+                            };
+                            if target.author_key != author || target.image.is_some() {
+                                continue;
+                            }
+                            self.history.edit(&self.store, id, &author, &text)?;
+                        }
+                        Payload::ChatDelete { id } => {
+                            let Some(target) = self.history.messages.iter().find(|m| m.id == id)
+                            else {
+                                continue;
+                            };
+                            // Authors may delete their own messages; the owner may delete any.
+                            if target.author_key != author && author != self.owner {
+                                continue;
+                            }
+                            let image = target.image;
+                            self.history.remove(&self.store, id)?;
+                            if let Some(image) = image {
+                                let _ = crate::attachments::remove(&self.store, image);
+                            }
                         }
                         Payload::Voice { .. } => {}
                         Payload::VoiceFrame {
@@ -619,13 +733,18 @@ impl Session {
                                 self.voice_in.push((author, channel, data));
                             }
                         }
-                        Payload::VoiceState { channel, muted } => {
+                        Payload::VoiceState {
+                            channel,
+                            muted,
+                            deafened,
+                        } => {
                             if channel.as_deref().is_some_and(|c| !valid_channel(c)) {
                                 continue;
                             }
                             if let Some(m) = self.members.get_mut(&author) {
                                 m.voice = channel;
                                 m.muted = muted;
+                                m.deafened = deafened;
                             }
                         }
                     }

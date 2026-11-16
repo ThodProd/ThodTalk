@@ -26,6 +26,13 @@ fn limits() -> image::Limits {
     l.max_alloc = Some(128 * 1024 * 1024);
     l
 }
+pub fn remove(store: &Store, id: uuid::Uuid) -> Result<()> {
+    let path = store.root.join(format!("image-{id}.bin"));
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
 pub fn save(store: &Store, id: uuid::Uuid, bytes: &[u8]) -> Result<()> {
     ensure!(bytes.len() <= MAX_IMAGE, "Слишком большое изображение");
     let mut reader =

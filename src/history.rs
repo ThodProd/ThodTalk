@@ -13,6 +13,8 @@ pub struct Message {
     pub timestamp_ms: u64,
     #[serde(default)]
     pub image: Option<uuid::Uuid>,
+    #[serde(default)]
+    pub edited: bool,
 }
 fn default_channel() -> String {
     "Общий".into()
@@ -53,6 +55,50 @@ impl History {
         }
         Ok(true)
     }
+    /// Change the text of a message owned by `author`.
+    pub fn edit(&mut self, store: &Store, id: uuid::Uuid, author: &[u8], text: &str) -> Result<bool> {
+        ensure!(
+            text.len() <= 16 * 1024 && !text.trim().is_empty(),
+            "Сообщение пустое или слишком большое"
+        );
+        let Some(index) = self.messages.iter().position(|m| m.id == id) else {
+            return Ok(false);
+        };
+        ensure!(
+            self.messages[index].author_key == author,
+            "Можно редактировать только свои сообщения"
+        );
+        if self.messages[index].image.is_some() {
+            return Ok(false);
+        }
+        let previous = self.messages[index].text.clone();
+        self.messages[index].text = text.into();
+        self.messages[index].edited = true;
+        if let Err(error) = store.save(&self.key, &self.messages) {
+            self.messages[index].text = previous;
+            self.messages[index].edited = false;
+            return Err(error);
+        }
+        Ok(true)
+    }
+    /// Remove a message from the local history.
+    pub fn remove(&mut self, store: &Store, id: uuid::Uuid) -> Result<bool> {
+        let Some(index) = self.messages.iter().position(|m| m.id == id) else {
+            return Ok(false);
+        };
+        let removed = self.messages.remove(index);
+        if let Err(error) = store.save(&self.key, &self.messages) {
+            self.messages.insert(index, removed);
+            return Err(error);
+        }
+        Ok(true)
+    }
+    pub fn author(&self, id: uuid::Uuid) -> Option<&[u8]> {
+        self.messages
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.author_key.as_slice())
+    }
 }
 
 #[cfg(test)]
@@ -72,6 +118,7 @@ mod tests {
             text: "Привет".into(),
             timestamp_ms: 1,
             image: None,
+            edited: false,
         };
         assert!(history.append(&store, message.clone()).unwrap());
         assert!(!history.append(&store, message.clone()).unwrap());

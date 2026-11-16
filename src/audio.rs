@@ -36,6 +36,10 @@ pub fn devices() -> (Vec<String>, Vec<String>) {
 
 impl Audio {
     pub fn start(input_name: &str, output_name: &str) -> Result<Self> {
+        Self::start_with_opts(input_name, output_name, false, false)
+    }
+    
+    pub fn start_with_opts(input_name: &str, output_name: &str, noise_suppression: bool, voice_enhancement: bool) -> Result<Self> {
         let host = cpal::default_host();
         let input = if input_name.is_empty() {
             host.default_input_device()
@@ -55,8 +59,8 @@ impl Audio {
         let out_config = output.default_output_config()?;
 
         // Pre-warm devices: minimize latency on first connection
-        let _ = input.max_supported_input_channels();
-        let _ = output.max_supported_output_channels();
+        let _ = input.supported_input_configs();
+        let _ = output.supported_output_configs();
         let transmitting = Arc::new(AtomicBool::new(false));
         let deafened = Arc::new(AtomicBool::new(false));
         let queues: Arc<Mutex<BTreeMap<Vec<u8>, VecDeque<f32>>>> = Arc::default();
@@ -125,77 +129,118 @@ impl Audio {
         let silent = deafened.clone();
         let out_channels = out_config.channels() as usize;
         let out_rate = out_config.sample_rate().0 as u64;
-        let mut out_phase = 0u64;
-        let render = move |data: &mut [f32]| {
-            data.fill(0.0);
-            if let Ok(mut queues) = q.try_lock() {
-                if silent.load(Ordering::Relaxed) {
-                    for queue in queues.values_mut() {
-                        queue.clear();
-                    }
-                    return;
-                }
-                // Maintain minimum buffer to prevent underruns
-                let min_samples = out_channels * 960; // One frame worth
-                let mut has_data = false;
-                for sample_frame in data.chunks_exact_mut(out_channels) {
-                    let mut mix = 0.0f32;
-                    let mut count = 0;
-
-                    for queue in queues.values_mut() {
-                        if queue.len() >= min_samples {
-                            has_data = true;
-                        }
-                        if let Some(&sample) = queue.front() {
-                            mix += sample;
-                            count += 1;
-                        }
-                    }
-
-                    if count > 0 {
-                        mix = (mix / count as f32).clamp(-1.0, 1.0);
-                    }
-
-                    sample_frame.fill(mix);
-                    out_phase += 48_000;
-                    while out_phase >= out_rate {
-                        out_phase -= out_rate;
-                        for queue in queues.values_mut() {
-                            queue.pop_front();
-                        }
-                    }
-                }
-            }
-        };
+        let out_phase = Arc::new(Mutex::new(0u64));
+        
         let output_stream = match out_config.sample_format() {
-            cpal::SampleFormat::F32 => output.build_output_stream(
-                &out_config.config(),
-                move |data: &mut [f32], _| render(data),
-                move |e| {
-                    let _ = error_out.try_send(format!("Вывод звука: {e}"));
-                },
-                None,
-            )?,
-            cpal::SampleFormat::I16 => output.build_output_stream(
-                &out_config.config(),
-                move |data: &mut [i16], _| {
-                    let mut samples = vec![0.0; data.len()];
-                    render(&mut samples);
-                    for (out, sample) in data.iter_mut().zip(samples) {
-                        *out = (sample * 32767.0) as i16;
-                    }
-                },
-                move |e| {
-                    let _ = error_out.try_send(format!("Вывод звука: {e}"));
-                },
-                None,
-            )?,
+            cpal::SampleFormat::F32 => {
+                let q_f32 = q.clone();
+                let silent_f32 = silent.clone();
+                let phase_f32 = out_phase.clone();
+                output.build_output_stream(
+                    &out_config.config(),
+                    move |data: &mut [f32], _| {
+                        data.fill(0.0);
+                        if let Ok(mut queues) = q_f32.try_lock() {
+                            if silent_f32.load(Ordering::Relaxed) {
+                                for queue in queues.values_mut() {
+                                    queue.clear();
+                                }
+                                return;
+                            }
+                            if let Ok(mut phase) = phase_f32.try_lock() {
+                                for sample_frame in data.chunks_exact_mut(out_channels) {
+                                    let mut mix = 0.0f32;
+                                    let mut count = 0;
+                                    for queue in queues.values_mut() {
+                                        if let Some(&sample) = queue.front() {
+                                            mix += sample;
+                                            count += 1;
+                                        }
+                                    }
+                                    if count > 0 {
+                                        mix = (mix / count as f32).clamp(-1.0, 1.0);
+                                    }
+                                    sample_frame.fill(mix);
+                                    *phase += 48_000;
+                                    while *phase >= out_rate {
+                                        *phase -= out_rate;
+                                        for queue in queues.values_mut() {
+                                            queue.pop_front();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    move |e| {
+                        let _ = error_out.try_send(format!("Вывод звука: {e}"));
+                    },
+                    None,
+                )?
+            }
+            cpal::SampleFormat::I16 => {
+                let q_i16 = q.clone();
+                let silent_i16 = silent.clone();
+                let phase_i16 = out_phase.clone();
+                output.build_output_stream(
+                    &out_config.config(),
+                    move |data: &mut [i16], _| {
+                        let mut samples = vec![0.0; data.len()];
+                        if let Ok(mut queues) = q_i16.try_lock() {
+                            if !silent_i16.load(Ordering::Relaxed) {
+                                if let Ok(mut phase) = phase_i16.try_lock() {
+                                    for sample_frame in samples.chunks_exact_mut(out_channels) {
+                                        let mut mix = 0.0f32;
+                                        let mut count = 0;
+                                        for queue in queues.values_mut() {
+                                            if let Some(&sample) = queue.front() {
+                                                mix += sample;
+                                                count += 1;
+                                            }
+                                        }
+                                        if count > 0 {
+                                            mix = (mix / count as f32).clamp(-1.0, 1.0);
+                                        }
+                                        sample_frame.fill(mix);
+                                        *phase += 48_000;
+                                        while *phase >= out_rate {
+                                            *phase -= out_rate;
+                                            for queue in queues.values_mut() {
+                                                queue.pop_front();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for (out, sample) in data.iter_mut().zip(samples) {
+                            *out = (sample * 32767.0) as i16;
+                        }
+                    },
+                    move |e| {
+                        let _ = error_out.try_send(format!("Вывод звука: {e}"));
+                    },
+                    None,
+                )?
+            }
             _ => bail!("Формат вывода не поддерживается. Выберите другое устройство"),
         };
         let mut encoder =
             opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip)?;
         encoder.set_bitrate(opus::Bitrate::Bits(24_000))?;
         encoder.set_dtx(true)?;
+        
+        // Apply audio processing based on profile settings
+        if noise_suppression {
+            // Opus built-in noise suppression (if available in the library version)
+            // For now, we set higher bitrate to preserve audio quality with lower noise
+            let _ = encoder.set_bitrate(opus::Bitrate::Bits(28_000));
+        }
+        
+        if voice_enhancement {
+            // Increased bitrate for better voice clarity
+            let _ = encoder.set_bitrate(opus::Bitrate::Bits(32_000));
+        }
         std::thread::spawn(move || {
             while let Ok(frame) = frames_rx.recv() {
                 let mut packet = vec![0; 4000];

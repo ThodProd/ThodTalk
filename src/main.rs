@@ -1112,7 +1112,10 @@ impl App {
                             .inner_margin(Margin::symmetric(8, 8)),
                     )
                     .show_separator_line(false)
-                    .show_inside(ui, |ui| self.account_panel(ui));
+                    .show_inside(ui, |ui| {
+                        self.update_banner(ui);
+                        self.account_panel(ui);
+                    });
                 self.sidebar_header(ui);
                 egui::ScrollArea::vertical()
                     .id_salt("sidebar-scroll")
@@ -1136,61 +1139,37 @@ impl App {
         let Some(version) = self.update_ready.as_ref().map(|p| p.version.clone()) else {
             return;
         };
-        let busy = self.session.is_some() || self.voice_channel.is_some();
-        let response = egui::Frame::new()
-            .fill(ui::accent(light).gamma_multiply(0.16))
-            .stroke(egui::Stroke::new(
-                1.0_f32,
-                ui::accent(light).gamma_multiply(0.55),
-            ))
+        let busy = self.session.is_some() || self.voice_channel.is_some() || self.connecting.is_some();
+        let green = if light { egui::Color32::from_rgb(25, 116, 65) } else { egui::Color32::from_rgb(105, 222, 150) };
+        let background = if light { egui::Color32::from_rgb(226, 246, 233) } else { egui::Color32::from_rgb(24, 51, 37) };
+        egui::Frame::new()
+            .fill(background)
+            .stroke(egui::Stroke::new(1.0_f32, green.gamma_multiply(0.45)))
             .corner_radius(9)
             .inner_margin(Margin::symmetric(10, 9))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    ui::icon_label(ui, ui::Icon::Download, 15.0, ui::accent(light));
-                    ui.label(
-                        RichText::new(format!("Доступно обновление {version}"))
-                            .size(12.5)
-                            .strong()
-                            .color(ui::accent(light)),
-                    );
-                });
-                ui.label(
-                    RichText::new(if busy {
-                        "Установится после завершения разговора"
-                    } else if auto {
-                        "Скачано. Перезапуск через несколько секунд…"
-                    } else {
-                        "Скачано. Нажмите, чтобы установить"
-                    })
-                    .size(11.5)
-                    .color(ui::muted(light)),
-                );
-            })
-            .response
-            .interact(Sense::click())
-            .on_hover_text(if busy {
-                "Откройте настройки обновлений"
-            } else if auto {
-                "Открыть настройки обновлений"
-            } else {
-                "Установить обновление и перезапустить ThodTalk"
+                ui.label(RichText::new("Доступна новая версия").size(12.5).strong().color(green));
+                ui.label(RichText::new(format!("ThodTalk {version}")).size(12.0).color(green));
+                ui.label(RichText::new(if busy {
+                    "Завершите подключение, чтобы обновить"
+                } else if auto {
+                    "Готово к установке · скоро перезапуск"
+                } else {
+                    "Загружено и проверено"
+                }).size(11.0).color(ui::muted(light)));
+                ui.add_space(6.0);
+                if ui.add_enabled(!busy, egui::Button::new(RichText::new("Обновить").color(green)))
+                    .on_hover_text("Установить новую версию и перезапустить ThodTalk")
+                    .clicked()
+                {
+                    self.install_update(ui.ctx());
+                }
+                if self.update_status.starts_with("Обновление не установлено:") {
+                    ui.label(RichText::new(&self.update_status).size(11.0).color(ui::danger(light)));
+                }
             });
-        if response.clicked() {
-            if busy || auto {
-                self.open_updates();
-            } else {
-                self.install_update(ui.ctx());
-            }
-        }
         ui.add_space(8.0);
-    }
-
-    fn open_updates(&mut self) {
-        self.open_settings();
-        self.settings_tab = SETTINGS_TABS.len() - 1;
     }
 
     fn sidebar_header(&mut self, ui: &mut egui::Ui) {
@@ -1229,7 +1208,6 @@ impl App {
 
     fn sidebar_body(&mut self, ui: &mut egui::Ui) {
         let light = self.profile.light_theme;
-        self.update_banner(ui);
         if self.session.is_none() {
             if ui::nav_row(
                 ui,

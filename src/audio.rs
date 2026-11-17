@@ -280,9 +280,6 @@ impl Audio {
             return Ok(false);
         }
         if !self.decoders.contains_key(&author) {
-            if self.decoders.len() >= 16 {
-                return Ok(false);
-            }
             self.decoders.insert(
                 author.clone(),
                 opus::Decoder::new(48_000, opus::Channels::Mono)?,

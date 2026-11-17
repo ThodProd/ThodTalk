@@ -1,1 +1,1 @@
-{"schemaVersion":1,"hubApi":1,"id":"thodtalk","version":"0.3.11","platform":"win-x64","mode":"standalone","launch":{"executable":"app/thodtalk.exe","arguments":[]},"permissions":[]}
+{"schemaVersion":1,"hubApi":1,"id":"thodtalk","version":"0.3.12","platform":"win-x64","mode":"standalone","launch":{"executable":"app/thodtalk.exe","arguments":[]},"permissions":[]}

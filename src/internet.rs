@@ -131,16 +131,10 @@ impl InternetHost {
         let address = relay.address;
         let gate = closed.clone();
         let task = runtime.spawn(async move {
-            let slots = Arc::new(tokio::sync::Semaphore::new(16));
             while let Some(incoming) = ep.accept().await {
-                let Ok(slot) = slots.clone().try_acquire_owned() else {
-                    incoming.refuse();
-                    continue;
-                };
                 let gate = gate.clone();
                 let info = info.clone();
                 tokio::spawn(async move {
-                    let _slot = slot;
                     let incoming_result =
                         tokio::time::timeout(Duration::from_secs(60), incoming).await;
 

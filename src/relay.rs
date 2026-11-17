@@ -44,20 +44,18 @@ impl Relay {
             let mut next_id = 1;
             while !stopped.load(Ordering::Relaxed) {
                 if let Ok((stream, _)) = listener.accept() {
-                    if peers.len() < 15 {
-                        if let Ok(connection) = Connection::from_stream(stream) {
-                            peers.insert(
-                                next_id,
-                                Peer {
-                                    connection,
-                                    admitted: false,
-                                    requested: false,
-                                    since: std::time::Instant::now(),
-                                    last_activity: std::time::Instant::now(),
-                                },
-                            );
-                            next_id += 1;
-                        }
+                    if let Ok(connection) = Connection::from_stream(stream) {
+                        peers.insert(
+                            next_id,
+                            Peer {
+                                connection,
+                                admitted: false,
+                                requested: false,
+                                since: std::time::Instant::now(),
+                                last_activity: std::time::Instant::now(),
+                            },
+                        );
+                        next_id += 1;
                     }
                 }
                 let mut failed = Vec::new();

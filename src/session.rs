@@ -721,10 +721,8 @@ impl Session {
                         continue;
                     }
                     let group = self.group.as_mut().context("Нет группы")?;
-                    if group.members().count() >= 16 {
-                        self.connection().send(Packet::Disconnect { connection })?;
-                        continue;
-                    }
+                    // No application-level member cap. Entry is controlled by
+                    // `closed`, bans and MLS key validation.
                     let old: Vec<_> = group.members().map(|m| m.index).collect();
                     let (commit, welcome) = match self.identity.add(group, &package) {
                         Ok(value) => value,

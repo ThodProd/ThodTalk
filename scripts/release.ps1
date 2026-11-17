@@ -126,9 +126,19 @@ try {
         $name = Split-Path $asset -Leaf
         if ($names -notcontains $name) { throw "В выпуске нет файла $name" }
     }
-    $digest = (Invoke-Native { gh api "repos/$repo/releases/tags/$tag" --jq ".assets[] | select(.name == `"$($package.zip | Split-Path -Leaf)`") | .digest" } | Out-String).Trim()
-    if ($digest -ne "sha256:$($package.sha256)") {
-        throw "SHA-256 загруженного ZIP не совпал: $digest"
+    # Do not put double quotes inside the jq expression: Windows PowerShell 5.1
+    # strips them when passing the argument to a native command.
+    $zipName = Split-Path $package.zip -Leaf
+    $expectedDigest = "sha256:$($package.sha256)"
+    $digest = ''
+    for ($attempt = 0; $attempt -lt 15; $attempt++) {
+        $digest = (Invoke-Native { gh api "repos/$repo/releases/tags/$tag" --jq ".assets[] | select(.name == '$zipName') | .digest" } | Out-String).Trim()
+        if ($LASTEXITCODE) { throw 'Не удалось проверить SHA-256 файла выпуска' }
+        if ($digest -eq $expectedDigest) { break }
+        Start-Sleep -Seconds 2
+    }
+    if ($digest -ne $expectedDigest) {
+        throw "SHA-256 загруженного ZIP не совпал: $digest (ожидался $expectedDigest)"
     }
 
     $exe = (Invoke-Native { git rev-parse --short HEAD } | Out-String).Trim()

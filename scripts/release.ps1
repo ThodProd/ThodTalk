@@ -126,14 +126,17 @@ try {
         $name = Split-Path $asset -Leaf
         if ($names -notcontains $name) { throw "В выпуске нет файла $name" }
     }
-    # Do not put double quotes inside the jq expression: Windows PowerShell 5.1
-    # strips them when passing the argument to a native command.
+    # Parse the JSON from gh instead of passing a jq expression through
+    # Windows PowerShell 5.1, which strips embedded double quotes.
     $zipName = Split-Path $package.zip -Leaf
     $expectedDigest = "sha256:$($package.sha256)"
     $digest = ''
     for ($attempt = 0; $attempt -lt 15; $attempt++) {
-        $digest = (Invoke-Native { gh api "repos/$repo/releases/tags/$tag" --jq ".assets[] | select(.name == '$zipName') | .digest" } | Out-String).Trim()
+        $releaseJson = (Invoke-Native { gh release view $tag --repo $repo --json assets } | Out-String)
         if ($LASTEXITCODE) { throw 'Не удалось проверить SHA-256 файла выпуска' }
+        $releaseInfo = $releaseJson | ConvertFrom-Json
+        $zipAsset = $releaseInfo.assets | Where-Object { $_.name -eq $zipName } | Select-Object -First 1
+        if ($zipAsset) { $digest = [string]$zipAsset.digest }
         if ($digest -eq $expectedDigest) { break }
         Start-Sleep -Seconds 2
     }

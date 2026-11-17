@@ -23,6 +23,8 @@ pub struct Profile {
     pub ptt_key: String,
     #[serde(default)]
     pub light_theme: bool,
+    #[serde(default)]
+    pub debug_terminal: bool,
     #[serde(default = "default_mute_key")]
     pub mute_key: String,
     #[serde(default = "default_deafen_key")]
@@ -56,6 +58,7 @@ impl Default for Profile {
             push_to_talk: false,
             ptt_key: default_ptt_key(),
             light_theme: false,
+            debug_terminal: false,
             mute_key: default_mute_key(),
             deafen_key: default_deafen_key(),
             sounds: true,

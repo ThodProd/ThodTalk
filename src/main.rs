@@ -322,6 +322,8 @@ impl App {
         self.avatar = texture(ctx, "avatar", &self.profile.avatar);
     }
     fn network_log(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        thodtalk::diagnostics::report("Сессия", None, &message);
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() % 86_400)
@@ -329,7 +331,7 @@ impl App {
         let h = stamp / 3600;
         let m = (stamp / 60) % 60;
         let s = stamp % 60;
-        self.network_log.push(format!("[{h:02}:{m:02}:{s:02}] {}", message.into()));
+        self.network_log.push(format!("[{h:02}:{m:02}:{s:02}] {}", message));
         if self.network_log.len() > 500 {
             self.network_log.drain(..self.network_log.len() - 500);
         }
@@ -420,6 +422,7 @@ impl App {
             self.profile.voice_enhancement,
         ) {
             Ok(audio) => {
+                thodtalk::diagnostics::report("Компьютер / аудиопоток", Some(true), "Микрофон и воспроизведение открыты");
                 self.sound(thodtalk::sounds::Sound::Join);
                 self.audio = Some(audio);
                 self.voice_channel = Some(channel.to_string());
@@ -431,7 +434,10 @@ impl App {
                     });
                 }
             }
-            Err(e) => self.error = format!("Не удалось включить голос: {e}"),
+            Err(e) => {
+                self.error = format!("Не удалось включить голос: {e}");
+                thodtalk::diagnostics::report("Компьютер / аудиопоток", Some(false), &self.error);
+            },
         }
     }
     fn toggle_user_mute(&mut self, key: Vec<u8>) {
@@ -826,6 +832,7 @@ impl App {
                         .insert(session.own_key(), std::time::Instant::now());
                 }
                 if let Ok(error) = audio.errors.try_recv() {
+                    thodtalk::diagnostics::report("Компьютер / аудиопоток", Some(false), &error);
                     self.error = error;
                 }
                 for _ in 0..8 {
@@ -859,7 +866,10 @@ impl App {
                                 self.speaking.insert(author, std::time::Instant::now());
                             }
                             Ok(false) => {}
-                            Err(e) => self.error = format!("Голосовой пакет: {e}"),
+                            Err(e) => {
+                                self.error = format!("Голосовой пакет: {e}");
+                                thodtalk::diagnostics::report("Голос / декодирование", Some(false), &self.error);
+                            },
                         }
                     }
                 }
@@ -3644,6 +3654,8 @@ impl App {
                 }
             }
             1 => {
+                ui.checkbox(&mut self.profile.debug_terminal, "Терминал отладки");
+                ui.label("Отдельное окно: компоненты, relay, этапы подключения и качество связи");
                 let mut theme_changed = false;
                 ui::card(ui, light, |ui| {
                     ui::setting_row(
@@ -3918,6 +3930,8 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        thodtalk::diagnostics::enable(self.profile.debug_terminal, self.store.root.clone());
+        thodtalk::diagnostics::window(ctx, &mut self.profile.debug_terminal);
         self.tray.poll(ctx, &mut self.allow_close);
         ctx.request_repaint_after(Duration::from_millis(250));
         self.tick(ctx);

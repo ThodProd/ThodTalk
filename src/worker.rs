@@ -174,7 +174,7 @@ impl SessionProxy {
             .env("THODHUB_DATA_DIR", &store.root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -184,6 +184,14 @@ impl SessionProxy {
             .spawn()
             .context("Не удалось запустить сетевой процесс")?;
         let mut input = child.stdin.take().unwrap();
+        let diagnostic_output = child.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(diagnostic_output);
+            while let Ok(entry) = read::<crate::diagnostics::Entry>(&mut reader) {
+                crate::diagnostics::ingest(entry);
+            }
+        });
+        crate::diagnostics::report("Worker", Some(true), "Сетевой процесс запущен, канал диагностики открыт");
         let output = child.stdout.take().unwrap();
         let (tx, rx) = mpsc::sync_channel(128);
         let (etx, erx) = mpsc::sync_channel(8);
@@ -229,7 +237,7 @@ impl SessionProxy {
             profile,
             code: code.into(),
         })?;
-        let deadline = Instant::now() + Duration::from_secs(40);
+        let deadline = Instant::now() + Duration::from_secs(65);
         loop {
             ensure!(!cancel.load(Ordering::Relaxed), "Подключение отменено");
             ensure!(Instant::now() < deadline, "Рабочий процесс не ответил");
@@ -265,6 +273,8 @@ impl SessionProxy {
                 self.ready = s.ready;
                 self.members = s.members.into_iter().collect();
                 self.history.messages = s.history;
+                if self.status != s.status { crate::diagnostics::report("MLS / сессия", Some(s.ready), &s.status); }
+                if !s.hosting { if let Some(ms) = s.ping_ms { crate::diagnostics::report("Связь / прикладной RTT до владельца", Some(ms < 300), format!("{ms} мс — зашифрованный запрос и ответ, включая обработку приложения")); } }
                 self.status = s.status;
                 self.code = s.code;
                 self.closed = s.closed;
@@ -290,8 +300,8 @@ impl SessionProxy {
             Event::ScreenWatch(watches) => {
                 self.screen_watch_in.extend(watches);
             }
-            Event::Error(error) => self.status = error,
-            Event::Fatal(error) => anyhow::bail!("{error}"),
+            Event::Error(error) => { crate::diagnostics::report("Worker / операция", Some(false), &error); self.status = error; },
+            Event::Fatal(error) => { crate::diagnostics::report("Сессия / ошибка", Some(false), &error); anyhow::bail!("{error}") },
         }
         Ok(())
     }
@@ -448,6 +458,7 @@ fn revision(session: &Session) -> u64 {
     hash.finish()
 }
 pub fn run() -> Result<()> {
+    crate::diagnostics::worker();
     let (tx, rx) = mpsc::sync_channel::<Request>(128);
     std::thread::spawn(move || {
         let mut input = BufReader::new(std::io::stdin());

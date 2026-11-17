@@ -14,6 +14,7 @@ fn main() -> anyhow::Result<()> {
         &Profile {
             name: "Тестовый участник".into(),
             network_allowed: true,
+            debug_terminal: std::env::args().any(|arg| arg == "--diagnostics"),
             ..Default::default()
         },
     )

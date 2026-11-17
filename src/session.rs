@@ -675,12 +675,19 @@ impl Session {
         Ok(())
     }
     pub fn poll(&mut self) -> Result<()> {
+        if self.hosting() && self.last_probe.elapsed().as_secs() >= 3 {
+            self.nonce = self.nonce.wrapping_add(1);
+            self.send(Payload::Probe { nonce: self.nonce })?;
+            self.probe_sent = Some(std::time::Instant::now());
+            self.last_probe = std::time::Instant::now();
+        }
         if !self.hosting() {
             ensure!(
                 self.last_owner.elapsed().as_secs() < 15,
                 "Сервер больше не отвечает. Сессия закрыта"
             );
             if self.group.is_some() && self.last_probe.elapsed().as_secs() >= 3 {
+                self.nonce = self.nonce.wrapping_add(1);
                 self.send(Payload::Probe { nonce: self.nonce })?;
                 self.probe_sent = Some(std::time::Instant::now());
                 self.last_probe = std::time::Instant::now();
@@ -800,11 +807,19 @@ impl Session {
                     }
                     match payload {
                         Payload::Probe { nonce } => {
-                            if self.hosting() {
+                            if self.hosting() || author == self.owner {
                                 self.send(Payload::Heartbeat { nonce })?;
                             }
                         }
                         Payload::Heartbeat { nonce } => {
+                            if self.hosting() && nonce == self.nonce && author != self.owner {
+                                if let Some(sent) = self.probe_sent {
+                                    let ms = sent.elapsed().as_millis();
+                                    let name = self.members.get(&author).map(|m| m.name.as_str()).unwrap_or("участник");
+                                    let short = author.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>();
+                                    crate::diagnostics::report(format!("Участник / {name} ({short})"), Some(ms < 300), format!("Прикладной RTT: {ms} мс. Запрос владельца → участник → владелец, включая MLS и обработку приложения"));
+                                }
+                            }
                             if author == self.owner && nonce == self.nonce {
                                 self.last_owner = std::time::Instant::now();
                                 self.confirmed = true;
@@ -1430,6 +1445,13 @@ mod tests {
         }
         pump(&mut host, &mut guests, |h, gs| {
             h.members.len() == 3 && gs.iter().all(|g| g.members.len() == 3)
+        });
+        host.last_probe = std::time::Instant::now() - std::time::Duration::from_secs(4);
+        for guest in &mut guests { guest.last_probe = host.last_probe; }
+        pump(&mut host, &mut guests, |_, gs| {
+            gs.iter().all(|g| g.ping_ms.is_some())
+                && crate::diagnostics::has_section("Участник / А (")
+                && crate::diagnostics::has_section("Участник / Б (")
         });
         guests[0].chat("Общий", "Сообщение друзьям").unwrap();
         pump(&mut host, &mut guests, |h, gs| {

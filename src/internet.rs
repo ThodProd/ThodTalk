@@ -77,6 +77,7 @@ impl InternetHost {
         InternetGuest::join_with(rt, ep, self.endpoint.addr(), self.token)
     }
     pub fn start() -> Result<Self> {
+        crate::diagnostics::report("Сервер", None, "Запуск локального relay и проверка двусторонней передачи QUIC через публичные relay");
         // A relay can accept HTTPS and QUIC handshakes yet stall on application
         // data. Race the production relays using a real bidirectional exchange.
         let (tx, rx) = mpsc::channel();
@@ -103,6 +104,7 @@ impl InternetHost {
                     Ok(host)
                 })()
                 .with_context(|| format!("Интернет-маршрут {relay}"));
+                crate::diagnostics::report(format!("QUIC проверка / {relay}"), if done.load(Ordering::Relaxed) { None } else { Some(result.is_ok()) }, match &result { Ok(_) => "Двусторонний обмен данными подтверждён".into(), Err(e) => format!("{e:#}") });
                 if result.is_ok() && done.swap(true, Ordering::SeqCst) {
                     return;
                 }
@@ -186,8 +188,10 @@ impl InternetHost {
                     })
                     .await;
 
-                    if let Ok(Ok((send, recv, tcp))) = setup {
-                        let _ = bridge(&connection, send, recv, tcp).await;
+                    match setup {
+                        Ok(Ok((send, recv, tcp))) => { let _ = bridge(&connection, send, recv, tcp).await; }
+                        Ok(Err(e)) => crate::diagnostics::report("Сервер / рукопожатие", Some(false), format!("{e:#}")),
+                        Err(_) => crate::diagnostics::report("Сервер / рукопожатие", Some(false), "Тайм-аут 30 с: приглашение или открытие потока сессии"),
                     }
                     connection.close(0u8.into(), b"closed");
                 });
@@ -232,12 +236,22 @@ async fn close_endpoint(endpoint: &Endpoint) {
     let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.close()).await;
 }
 
+/// Isolated, relay-only round trip: does not join rooms or read user profiles.
+pub fn diagnostic_relay(relay: iroh::RelayUrl) -> Result<u128> {
+    let runtime = runtime()?;
+    let endpoint = runtime.block_on(Endpoint::builder(presets::Minimal)
+        .clear_ip_transports().relay_mode(iroh::RelayMode::custom([relay.clone()]))
+        .alpns(vec![ROUTE_ALPN.to_vec()]).bind())?;
+    let host = InternetHost::start_with(Relay::start("127.0.0.1:0".parse()?)?, runtime, endpoint)?;
+    host.runtime.block_on(check_public_route(&host.endpoint, relay, Arc::new(AtomicBool::new(false))))
+}
+
 // This health exchange has no LAN/IP transport and cannot pass via loopback.
 async fn check_public_route(
     host: &Endpoint,
     relay: iroh::RelayUrl,
     cancel: Arc<AtomicBool>,
-) -> Result<()> {
+) -> Result<u128> {
     let probe = Endpoint::builder(presets::Minimal)
         .clear_ip_transports()
         .relay_mode(iroh::RelayMode::custom([relay.clone()]))
@@ -247,12 +261,13 @@ async fn check_public_route(
         result = tokio::time::timeout(Duration::from_secs(30), async {
             host.online().await;
             let connection = probe.connect(EndpointAddr::new(host.id()).with_relay_url(relay), ROUTE_ALPN).await?;
+            let started = std::time::Instant::now();
             let (mut send, mut recv) = connection.open_bi().await?;
             send.write_all(&[1]).await?;
             send.finish()?;
             ensure!(recv.read_u8().await? == 1, "Relay не подтвердил передачу данных");
             connection.close(0u8.into(), b"route checked");
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, anyhow::Error>(started.elapsed().as_millis())
         }) => result.context("Relay не передаёт данные за 30 секунд").and_then(|result| result),
         _ = async {
             while !cancel.load(Ordering::Relaxed) {
@@ -294,7 +309,9 @@ pub struct InternetGuest {
 }
 impl InternetGuest {
     pub fn join(code: &str) -> Result<Self> {
-        let (address, token) = parse_address_code(code)?;
+        crate::diagnostics::report("Подключение / приглашение", None, "Проверка формата и адреса приглашения");
+        let (address, token) = parse_address_code(code).context("Этап: разбор приглашения")?;
+        crate::diagnostics::report("Подключение / приглашение", Some(true), format!("Формат принят; relay: {}", address.relay_urls().map(|u| u.to_string()).collect::<Vec<_>>().join(", ")));
         let (tx, rx) = mpsc::channel();
         let done = Arc::new(AtomicBool::new(false));
         for relay_only in [false, true] {
@@ -378,7 +395,10 @@ impl InternetGuest {
         cancel: Arc<AtomicBool>,
     ) -> Result<Self> {
         let mut stage = "установка QUIC-соединения";
+        crate::diagnostics::report("Подключение / QUIC", None, stage);
         let mut last_error = String::new();
+        let started = std::time::Instant::now();
+        let mut attempt = 0;
         let setup = runtime.block_on(async {
             let dial = tokio::time::timeout(Duration::from_secs(45), async {
                 // QUIC authenticates the exact public key embedded in the invitation.
@@ -386,6 +406,7 @@ impl InternetGuest {
                 // the first dial. Keep retrying the same authenticated address
                 // instead of turning a transient miss into a hard timeout.
                 let quic = loop {
+                    attempt += 1;
                     match tokio::time::timeout(Duration::from_secs(10), endpoint.connect(address.clone(), ALPN)).await {
                         Ok(Ok(connection)) => break connection,
                         result => {
@@ -395,12 +416,14 @@ impl InternetGuest {
                                 _ => unreachable!(),
                             };
 
+                            crate::diagnostics::report("Подключение / QUIC", Some(false), format!("Попытка {attempt}, прошло {} с: {last_error}. Повтор через 750 мс", started.elapsed().as_secs()));
                             tokio::time::sleep(Duration::from_millis(750)).await;
                         }
                     }
                 };
 
                 stage = "проверка приглашения сервером";
+                crate::diagnostics::report("Подключение / этап", None, stage);
                 let (mut send, mut recv) = quic.open_bi().await?;
 
                 send.write_all(&token)
@@ -427,6 +450,7 @@ impl InternetGuest {
                 );
 
                 stage = "открытие потока сессии";
+                crate::diagnostics::report("Подключение / этап", None, stage);
                 let (mut send, mut recv) = quic.open_bi().await?;
                 send.write_all(&[3]).await?;
 
@@ -452,7 +476,7 @@ impl InternetGuest {
             Ok(value) => value,
             Err(error) => {
                 runtime.block_on(close_endpoint(&endpoint));
-                return Err(error);
+                return Err(error.context(format!("Этап: {stage}")));
             }
         };
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -684,5 +708,30 @@ async fn bridge(
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
     };
-    tokio::select! { r = outgoing => r, r = reliable_out => r, r = reliable => r, r = voice => r }
+    let peer = format!("Участник QUIC / {}", connection.remote_id().fmt_short());
+    let monitor = async {
+        let mut previous = (0u64, 0u64);
+        let mut last_rtt: Option<u128> = None;
+        let mut previous_lost = 0;
+        loop {
+            let stats = connection.stats();
+            let paths = connection.paths();
+            let selected = paths.iter().find(|p| p.is_selected());
+            let rtt = selected.as_ref().map(|p| p.rtt().as_millis());
+            let route = selected.as_ref().map(|p| if p.is_relay() { "relay" } else { "прямой" }).unwrap_or("не выбран");
+            let jitter = rtt.zip(last_rtt).map(|(a,b)| a.abs_diff(b));
+            let rx = stats.udp_rx.bytes;
+            let tx = stats.udp_tx.bytes;
+            let lost = stats.lost_packets;
+            let sent = stats.sent_packets;
+            let new_lost = lost.saturating_sub(previous_lost);
+            previous_lost = lost;
+            crate::diagnostics::report(&peer, rtt.map(|ms| ms < 300 && new_lost == 0), format!("Маршрут: {route}; RTT: {} мс; изменение RTT: {} мс; RX/TX за интервал: {}/{} байт; всего: {rx}/{tx}; QUIC потери/отправлено: {lost}/{sent} (+{new_lost} потерь за интервал). RTT транспорта, не задержка голоса", rtt.map(|v| v.to_string()).unwrap_or_else(|| "нет измерения".into()), jitter.map(|v| v.to_string()).unwrap_or_else(|| "—".into()), rx.saturating_sub(previous.0), tx.saturating_sub(previous.1)));
+            previous = (rx, tx); last_rtt = rtt;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    };
+    let result = tokio::select! { r = outgoing => r, r = reliable_out => r, r = reliable => r, r = voice => r, _ = monitor => unreachable!() };
+    crate::diagnostics::report(&peer, Some(false), match &result { Ok(()) => "Поток закрыт".into(), Err(e) => format!("Передача завершилась: {e:#}") });
+    result
 }

@@ -12,3 +12,5 @@ pub mod transport;
 pub mod updater;
 pub mod wire;
 pub mod worker;
+
+pub mod diagnostics;

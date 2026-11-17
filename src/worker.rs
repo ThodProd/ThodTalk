@@ -22,6 +22,7 @@ use std::{
 const MAX_LINE: usize = 16 * 1024 * 1024;
 #[derive(Serialize, Deserialize)]
 enum Request {
+    Shutdown,
     Start {
         hosting: bool,
         profile: Profile,
@@ -255,7 +256,10 @@ impl SessionProxy {
     fn apply(&mut self, event: Event) -> Result<()> {
         match event {
             Event::State(s) => {
-                ensure!(s.hosting == self.hosting, "Сетевая сессия изменила роль подключения");
+                ensure!(
+                    s.hosting == self.hosting,
+                    "Сетевая сессия изменила роль подключения"
+                );
                 self.key = s.key;
                 self.hosting = s.hosting;
                 self.ready = s.ready;
@@ -379,8 +383,18 @@ impl SessionProxy {
 }
 impl Drop for SessionProxy {
     fn drop(&mut self) {
-        self.requests.take();
-        // All durable data is flushed during operations. Kill only this owned child.
+        // Give QUIC time to send its close frame so a quick rejoin does not leave
+        // the old member alive at the host. Never kill unrelated app instances.
+        if let Some(requests) = self.requests.take() {
+            let _ = requests.try_send(Request::Shutdown);
+        }
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -439,6 +453,10 @@ pub fn run() -> Result<()> {
         let mut input = BufReader::new(std::io::stdin());
         loop {
             match read(&mut input) {
+                Ok(Request::Shutdown) => {
+                    let _ = tx.send(Request::Shutdown);
+                    return;
+                }
                 Ok(request) => {
                     if tx.send(request).is_err() {
                         return;
@@ -478,6 +496,7 @@ pub fn run() -> Result<()> {
                 break;
             };
             let result = match request {
+                Request::Shutdown => return Ok(()),
                 Request::Chat { channel, text } => session.chat(&channel, &text),
                 Request::Edit { id, text } => session.edit_chat(id, &text),
                 Request::Delete { id, everywhere } => session.delete_chat(id, everywhere),

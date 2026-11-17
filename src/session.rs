@@ -180,7 +180,7 @@ impl Session {
             profile.network_allowed,
             "Разрешите подключение к сети в профиле"
         );
-        let identity = Identity::load_or_create(&store, profile.id.as_bytes())?;
+        let identity = Identity::load_for_session(&store, profile.id.as_bytes())?;
         let room = store
             .load::<uuid::Uuid>("owned-room")?
             .unwrap_or_else(uuid::Uuid::new_v4);
@@ -236,7 +236,7 @@ impl Session {
         Self::from_guest(store, profile, InternetGuest::join(code)?)
     }
     fn from_guest(store: Store, profile: Profile, guest: InternetGuest) -> Result<Self> {
-        let identity = Identity::load_or_create(&store, profile.id.as_bytes())?;
+        let identity = Identity::load_for_session(&store, profile.id.as_bytes())?;
         let room = guest.invitation.room;
         let owner = guest.invitation.owner_key.clone();
         let package = identity.key_package()?;
@@ -689,10 +689,7 @@ impl Session {
         if let Some(rx) = &self.invite {
             if let Ok(event) = rx.try_recv() {
                 match event {
-                    PairEvent::LocalCode(code) => {
-                        self.code = code;
-                        self.status = "Интернет-relay недоступен. Доступно прямое подключение; для интернета повторите запуск или задайте THODTALK_RELAY_URLS".into();
-                    }
+                    PairEvent::Error(error) => anyhow::bail!("{error}"),
                     PairEvent::Code(code) => {
                         self.code = code;
                         self.status =
@@ -1410,8 +1407,8 @@ mod tests {
             InternetHost::local,
         )
         .unwrap();
-        pump(&mut host, &mut [], |h, _| !h.code.is_empty());
-        let code = host.code.clone();
+        // Local protocol tests must never manufacture an internet invitation.
+        assert!(host.code.is_empty());
         let room = host.room;
         let mut guests = Vec::new();
         for name in ["А", "Б"] {
@@ -1483,13 +1480,12 @@ mod tests {
         });
         guests[0].chat("Общий", "Оставшийся участник").unwrap();
         pump(&mut host, &mut guests, |h, _| h.history.messages.len() == 3);
-        assert_eq!(host.code, code);
+        assert!(host.code.is_empty());
         drop(guests);
         drop(host);
-        let mut next =
+        let next =
             Session::host_with(Store::open(root).unwrap(), owner, InternetHost::local).unwrap();
-        pump(&mut next, &mut [], |h, _| !h.code.is_empty());
-        assert_ne!(next.code, code);
+        assert!(next.code.is_empty());
         assert_eq!(next.room, room);
         assert_eq!(next.history.messages.len(), 3);
     }

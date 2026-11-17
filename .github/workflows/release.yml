@@ -1,0 +1,86 @@
+name: Release (manual CI)
+
+# The normal release path is scripts/release.ps1 on a developer machine.
+# Use this workflow only when you cannot build locally. It publishes files for
+# an existing tag and never rewrites a published release.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag, for example hub-v0.3.11'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      CMAKE_GENERATOR: MinGW Makefiles
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+      CFLAGS: '-std=c11'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils mingw-w64-x86_64-make make
+          path-type: inherit
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify tag and version
+        shell: pwsh
+        run: |
+          $tag = '${{ inputs.tag }}'
+          if ($tag -notmatch '^hub-v(\d+\.\d+\.\d+)$') { throw "Invalid tag: $tag" }
+          $version = $Matches[1]
+          $manifest = (Get-Content hub/manifest.json -Raw | ConvertFrom-Json).version
+          if ($manifest -ne $version) { throw "manifest version $manifest != tag $version" }
+      - name: Package
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\mingw64\bin;$env:Path"
+          $notes = (git log -1 --pretty=%B | Out-String).Trim()
+          if (!$notes) { $notes = 'ThodTalk update' }
+          .\scripts\package-release.ps1 -Notes $notes
+          if ($LASTEXITCODE) { throw 'package-release.ps1 failed' }
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ inputs.tag }}'
+          $version = $tag.Substring(6)
+          $dir = "dist/$version"
+          $names = @(
+            "thodtalk-$version-win-x64.zip",
+            'thodtalk-release.json',
+            'thodhub-release.json',
+            "thodtalk-$version-win-x64.zip.sha256",
+            'verification.txt'
+          )
+          $assets = foreach ($name in $names) {
+            $path = Join-Path $dir $name
+            if (!(Test-Path $path)) { throw "Missing $path" }
+            (Resolve-Path $path).Path
+          }
+          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          [IO.File]::WriteAllText($notesFile, (git log -1 --pretty=%B | Out-String).Trim(), [Text.UTF8Encoding]::new($false))
+          $arguments = @(
+            'release', 'create', $tag,
+            '--repo', 'ThodProd/ThodTalk',
+            '--title', "ThodTalk $version",
+            '--notes-file', $notesFile,
+            '--verify-tag',
+            '--latest'
+          ) + $assets
+          gh @arguments
+          if ($LASTEXITCODE) { throw 'gh release create failed' }

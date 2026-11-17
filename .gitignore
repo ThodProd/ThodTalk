@@ -1,4 +1,5 @@
 /target/
+/target_tray/
 /dist/
 /test-data/
 /Release_v0.3.2/

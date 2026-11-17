@@ -24,6 +24,7 @@ struct Peer {
     admitted: bool,
     requested: bool,
     since: std::time::Instant,
+    last_activity: std::time::Instant,
 }
 
 impl Relay {
@@ -52,6 +53,7 @@ impl Relay {
                                     admitted: false,
                                     requested: false,
                                     since: std::time::Instant::now(),
+                                    last_activity: std::time::Instant::now(),
                                 },
                             );
                             next_id += 1;
@@ -59,7 +61,8 @@ impl Relay {
                     }
                 }
                 let mut failed = Vec::new();
-                loop {
+                // Owner traffic must not starve guest probes and voice processing.
+                for _ in 0..32 {
                     let packet = match control.incoming.try_recv() {
                         Ok(p) => p,
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -103,7 +106,12 @@ impl Relay {
                 let mut forward = Vec::new();
                 let mut departed = failed;
                 for (&id, peer) in peers.iter_mut() {
-                    if !peer.admitted && peer.since.elapsed() > Duration::from_secs(60) {
+                    // Guests send a session probe every three seconds. Do not
+                    // leave a dead membership around for QUIC's PTO-dependent
+                    // transport timeout after a process/computer disappears.
+                    if (peer.admitted && peer.last_activity.elapsed() > Duration::from_secs(15))
+                        || (!peer.admitted && peer.since.elapsed() > Duration::from_secs(60))
+                    {
                         departed.push(id);
                         continue;
                     }
@@ -117,6 +125,9 @@ impl Relay {
                                 break;
                             }
                         };
+                        if packet.is_ok() {
+                            peer.last_activity = std::time::Instant::now();
+                        }
                         match packet {
                             Ok(Packet::Join { package })
                                 if !peer.requested && package.len() < 64 * 1024 =>

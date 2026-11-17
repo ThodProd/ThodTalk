@@ -1,4 +1,4 @@
-﻿param([string]$HubCheckout = 'D:\Every\ThodHUB-contract', [string]$OutputDirectory = '')
+﻿param([string]$HubCheckout = 'D:\Every\ThodHUB-contract', [string]$OutputDirectory = '', [string]$Notes = '')
 $ErrorActionPreference = 'Stop'
 function Get-RelativePath([string]$Base, [string]$Path) {
     $baseFull = [IO.Path]::GetFullPath($Base)
@@ -68,7 +68,8 @@ try {
     Copy-Item (Join-Path $sysroot 'share/doc/rust/licenses') $runtimeNotices -Recurse
     Copy-Item (Join-Path $sysroot 'share/doc/COPYING.RUNTIME'),(Join-Path $sysroot 'share/doc/COPYING3') $runtimeNotices
     $output = if ($OutputDirectory) {$OutputDirectory} else {Join-Path $root ('dist/' + $manifest.version)}
-    & (Join-Path $HubCheckout 'scripts/package-module.ps1') -PackageDirectory $stage -Repository 'ThodProd/ThodTalk' -OutputDirectory $output -Notes 'Новый интерфейс в стиле Discord: каналы, участники, настройки и понятные иконки. Исправлена проверка обновлений. Голос через MLS/QUIC DATAGRAM; проверка живого владельца.'
+    $releaseNotes = if ($Notes) { $Notes } else { 'Исправлены выбор интернет-relay и повторный вход с сохранённым профилем. Приглашение выдаётся после проверки интернет-маршрута. Удалены LAN-discovery и тестовые переключатели сети. Штатное завершение сетевого процесса при отключении.' }
+    & (Join-Path $HubCheckout 'scripts/package-module.ps1') -PackageDirectory $stage -Repository 'ThodProd/ThodTalk' -OutputDirectory $output -Notes $releaseNotes
     if ($LASTEXITCODE) {throw 'Проверка пакета не пройдена'}
     Write-Output "Каталог пакета: $stage"
 } finally {Pop-Location}

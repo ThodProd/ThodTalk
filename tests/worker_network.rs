@@ -20,7 +20,6 @@ impl Client {
         command
             .arg("--session-worker")
             .env("THODHUB_DATA_DIR", path)
-            .env("THODTALK_TEST_PUBLIC_ONLY", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -151,4 +150,47 @@ fn packaged_workers_public_chat_voice_and_kick() {
     wait(&mut clients, 15, |cs| cs.iter().all(|c| c.messages() == 2));
     assert_eq!(clients[0].state["code"].as_str().unwrap(), code);
     assert_eq!(clients[0].state["closed"], true);
+}
+
+#[test]
+#[ignore = "Public relay: repeated joins with the same persisted identity"]
+fn public_rejoin_after_shutdown_and_worker_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut clients = vec![Client::start(&dir.path().join("host"), "Host", true, "")];
+    wait(&mut clients, 35, |cs| {
+        cs[0].state["code"].as_str().is_some_and(|s| !s.is_empty())
+    });
+    let code = clients[0].state["code"].as_str().unwrap().to_owned();
+    let mut key = Value::Null;
+    for cycle in 0..4 {
+        eprintln!("Rejoin cycle {cycle}");
+        clients.push(Client::start(
+            &dir.path().join("guest"),
+            "Guest",
+            false,
+            &code,
+        ));
+        wait(&mut clients, 35, |cs| cs.iter().all(|c| c.members() == 2));
+        if cycle == 0 {
+            key = clients[1].state["key"].clone();
+        }
+        assert_eq!(
+            clients[1].state["key"], key,
+            "Must reconnect with the same identity"
+        );
+        clients[1].send(json!({"Chat":{"channel":"Общий","text":format!("Rejoin {cycle}")}}));
+        wait(&mut clients, 10, |cs| cs[0].messages() == cycle + 1);
+        if cycle % 2 == 0 {
+            clients[1].send(json!("Shutdown"));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while clients[1].child.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "Worker did not shut down");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        clients.pop(); // Odd cycles emulate an abrupt process restart.
+        eprintln!("Waiting for departed member cleanup after cycle {cycle}");
+        wait(&mut clients, 20, |cs| cs[0].members() == 1);
+        assert_eq!(clients[0].state["code"], code);
+    }
 }

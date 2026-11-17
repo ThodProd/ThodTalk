@@ -67,6 +67,18 @@ impl Identity {
             Ok(identity)
         }
     }
+    /// A connection is a fresh MLS membership, even when rejoining the same host.
+    /// Keep the durable signing identity, but never restore a departed group's
+    /// ratchets/key packages into the new session. History is stored separately.
+    pub fn load_for_session(store: &crate::storage::Store, id: &[u8]) -> Result<Self> {
+        let identity = Self::load_or_create(store, id)?;
+        Ok(Self {
+            provider: OpenMlsRustCrypto::default(),
+            signer: identity.signer,
+            credential: identity.credential,
+        })
+    }
+
     pub fn new(id: &[u8]) -> Result<Self> {
         let provider = OpenMlsRustCrypto::default();
         let signer = SignatureKeyPair::new(SUITE.signature_algorithm())?;
@@ -249,6 +261,36 @@ mod tests {
             b"after restart"
         );
     }
+    #[test]
+    fn fresh_session_rejoins_persisted_group_with_same_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::storage::Store::open(dir.path().to_owned()).unwrap();
+        let owner = Identity::new(b"owner").unwrap();
+        let mut group = owner.create_group().unwrap();
+        let mut expected_key = None;
+        for _ in 0..3 {
+            let guest = Identity::load_for_session(&store, b"guest").unwrap();
+            if let Some(key) = &expected_key {
+                assert_eq!(&guest.public_key(), key);
+            }
+            expected_key = Some(guest.public_key());
+            let (_, welcome) = owner
+                .add(&mut group, &guest.key_package().unwrap())
+                .unwrap();
+            let mut joined = guest.join(&welcome).unwrap();
+            let encrypted = owner.encrypt(&mut group, b"rejoined").unwrap();
+            assert_eq!(
+                guest.receive(&mut joined, &encrypted).unwrap().unwrap(),
+                b"rejoined"
+            );
+            guest.save(&store).unwrap();
+            group
+                .remove_members(&owner.provider, &owner.signer, &[joined.own_leaf_index()])
+                .unwrap();
+            group.merge_pending_commit(&owner.provider).unwrap();
+        }
+    }
+
     #[test]
     fn removed_member_cannot_read_new_epoch() {
         let alice = Identity::new(b"alice").unwrap();

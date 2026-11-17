@@ -3,9 +3,116 @@ use eframe::egui;
 use eframe::egui::{Align, Frame, Layout, Margin, Rect, RichText, Sense, Vec2, pos2, vec2};
 mod ui;
 use std::{
-    sync::{atomic::Ordering, mpsc},
-    time::Duration,
+    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, mpsc},
+    time::{Duration, Instant},
 };
+
+#[cfg(windows)]
+struct TrayController {
+    _icon: tray_icon::TrayIcon,
+    show: Arc<AtomicBool>,
+    quit: Arc<AtomicBool>,
+    repaint: Arc<Mutex<Option<egui::Context>>>,
+    hwnd: Arc<std::sync::atomic::AtomicIsize>,
+}
+
+#[cfg(windows)]
+impl TrayController {
+    fn new(rgba: Vec<u8>, width: u32, height: u32) -> anyhow::Result<Self> {
+        use tray_icon::{Icon, TrayIconBuilder, menu::{Menu, MenuEvent, MenuItem}};
+        let open = MenuItem::with_id("open", "Открыть ThodTalk", true, None);
+        let close = MenuItem::with_id("close", "Закрыть ThodTalk", true, None);
+        let menu = Menu::new();
+        menu.append(&open)?;
+        menu.append(&close)?;
+        let show = Arc::new(AtomicBool::new(false));
+        let quit = Arc::new(AtomicBool::new(false));
+        let repaint: Arc<Mutex<Option<egui::Context>>> = Arc::new(Mutex::new(None));
+        let hwnd = Arc::new(std::sync::atomic::AtomicIsize::new(0));
+        let menu_hwnd = hwnd.clone();
+        let show_menu = show.clone();
+        let quit_menu = quit.clone();
+        let repaint_menu = repaint.clone();
+        let open_id = open.id().clone();
+        let close_id = close.id().clone();
+        MenuEvent::set_event_handler(Some(move |event: tray_icon::menu::MenuEvent| {
+            if event.id == open_id { show_menu.store(true, Ordering::Relaxed); }
+            if event.id == close_id { quit_menu.store(true, Ordering::Relaxed); }
+            if event.id == open_id || event.id == close_id {
+                Self::restore_native(menu_hwnd.load(Ordering::Relaxed));
+            }
+            if let Ok(ctx) = repaint_menu.lock() {
+                if let Some(ctx) = ctx.as_ref() { ctx.request_repaint(); }
+            }
+        }));
+        let show_tray = show.clone();
+        let repaint_tray = repaint.clone();
+        let tray_hwnd = hwnd.clone();
+        tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
+            if matches!(event, tray_icon::TrayIconEvent::DoubleClick { .. }) {
+                show_tray.store(true, Ordering::Relaxed);
+                Self::restore_native(tray_hwnd.load(Ordering::Relaxed));
+                if let Ok(ctx) = repaint_tray.lock() {
+                    if let Some(ctx) = ctx.as_ref() { ctx.request_repaint(); }
+                }
+            }
+        }));
+        let icon = Icon::from_rgba(rgba, width, height)
+            .map_err(|e| anyhow::anyhow!("Не удалось создать значок трея: {e}"))?;
+        let icon = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("ThodTalk")
+            .with_icon(icon)
+            .build()?;
+        Ok(Self { _icon: icon, show, quit, repaint, hwnd })
+    }
+
+    fn restore_native(handle: isize) {
+        if handle == 0 { return; }
+        use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SetForegroundWindow, SW_RESTORE};
+        // Hidden windows do not receive redraws. Restore the native window before
+        // asking egui to process the pending open/quit action.
+        unsafe {
+            ShowWindow(handle as _, SW_RESTORE);
+            SetForegroundWindow(handle as _);
+        }
+    }
+
+    fn attach_context(&self, cc: &eframe::CreationContext<'_>) {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = cc.window_handle() {
+            if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                self.hwnd.store(handle.hwnd.get(), Ordering::Relaxed);
+            }
+        }
+        if let Ok(mut repaint) = self.repaint.lock() { *repaint = Some(cc.egui_ctx.clone()); }
+    }
+
+    fn poll(&self, ctx: &egui::Context, allow_close: &mut bool) {
+        if self.show.swap(false, Ordering::Relaxed) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if self.quit.swap(false, Ordering::Relaxed) {
+            *allow_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if ctx.input(|input| input.viewport().close_requested()) && !*allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+struct TrayController;
+
+#[cfg(not(windows))]
+impl TrayController {
+    fn new(_: Vec<u8>, _: u32, _: u32) -> anyhow::Result<Self> { Ok(Self) }
+    fn attach_context(&self, _: &eframe::CreationContext<'_>) {}
+    fn poll(&self, _: &egui::Context, _: &mut bool) {}
+}
 use thodtalk::{
     audio::Audio,
     session::Payload,
@@ -72,9 +179,9 @@ struct App {
     update_rx: Option<mpsc::Receiver<anyhow::Result<Option<thodtalk::updater::Prepared>>>>,
     update_ready: Option<thodtalk::updater::Prepared>,
     update_status: String,
-    update_started: bool,
+    update_next_check: Option<Instant>,
+    update_ready_at: Option<Instant>,
     network_log: Vec<String>,
-    show_network_log: bool,
     reconnect_attempts: u32,
     last_disconnect_time: Option<std::time::Instant>,
     last_hosting: bool,
@@ -84,6 +191,8 @@ struct App {
     share_hud_seq: u64,
     screen: Option<ScreenView>,
     screen_visible: bool,
+    screen_fullscreen: bool,
+    last_screen_sent: std::time::Instant,
     screen_watch: Option<(Vec<u8>, String)>,
     stream_viewers: std::collections::BTreeSet<Vec<u8>>,
     share_picker: bool,
@@ -91,6 +200,8 @@ struct App {
     share_source: usize,
     file_preview: Option<(uuid::Uuid, String, u64)>,
     _lock: std::fs::File,
+    tray: TrayController,
+    allow_close: bool,
 }
 
 struct ScreenView {
@@ -98,9 +209,20 @@ struct ScreenView {
     author: Vec<u8>,
     updated: std::time::Instant,
 }
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel_connect.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.connecting.take();
+        self.session.take();
+    }
+}
+
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, store: Store, lock: std::fs::File) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, store: Store, lock: std::fs::File, tray: TrayController) -> Self {
         ui::fonts(&cc.egui_ctx);
+        tray.attach_context(cc);
         let (profile, saved, error) = match store.load::<Profile>("profile") {
             Ok(Some(p)) => (p, true, String::new()),
             Ok(None) => (Profile::default(), false, String::new()),
@@ -160,9 +282,9 @@ impl App {
             update_rx: None,
             update_ready: None,
             update_status: String::new(),
-            update_started: false,
+            update_next_check: Some(Instant::now() + Duration::from_secs(3)),
+            update_ready_at: None,
             network_log: Vec::new(),
-            show_network_log: false,
             reconnect_attempts: 0,
             last_disconnect_time: None,
             last_hosting: false,
@@ -172,6 +294,8 @@ impl App {
             share_hud_seq: 0,
             screen: None,
             screen_visible: true,
+            screen_fullscreen: false,
+            last_screen_sent: std::time::Instant::now(),
             screen_watch: None,
             stream_viewers: std::collections::BTreeSet::new(),
             share_picker: false,
@@ -179,6 +303,8 @@ impl App {
             share_source: 0,
             file_preview: None,
             _lock: lock,
+            tray,
+            allow_close: false,
         };
         app.input_device = app.profile.input_device.clone();
         app.output_device = app.profile.output_device.clone();
@@ -473,6 +599,12 @@ impl App {
             while let Ok(result) = share.frames.try_recv() {
                 match result {
                     Ok(frame) => {
+                        let ping = self.session.as_ref().and_then(|s| s.ping_ms).unwrap_or(0);
+                        let interval = if ping >= 700 { 1500 } else if ping >= 350 { 750 } else { 350 };
+                        if self.last_screen_sent.elapsed() < Duration::from_millis(interval) {
+                            continue;
+                        }
+                        self.last_screen_sent = std::time::Instant::now();
                         if let (Some(session), Some(channel)) =
                             (&mut self.session, &self.voice_channel)
                         {
@@ -533,7 +665,11 @@ impl App {
         }
     }
     fn tick(&mut self, ctx: &egui::Context) {
-        if self.saved && self.profile.auto_update && !self.update_started {
+        let now = Instant::now();
+        if self.update_rx.is_none()
+            && self.update_ready.is_none()
+            && self.update_next_check.is_none_or(|at| now >= at)
+        {
             self.check_updates();
         }
         if let Some(rx) = &self.update_rx {
@@ -542,25 +678,45 @@ impl App {
                 match result {
                     Ok(Some(prepared)) => {
                         self.update_status = format!(
-                            "Версия {} загружена. Перезапуск после завершения разговора.",
-                            prepared.version
+                            "Версия {} загружена и проверена. {}",
+                            prepared.version,
+                            if self.profile.auto_update {
+                                "Приложение перезапустится автоматически."
+                            } else {
+                                "Нажмите «Установить и перезапустить»."
+                            }
                         );
                         self.update_ready = Some(prepared);
+                        self.update_ready_at = Some(Instant::now());
+                        self.update_next_check =
+                            Some(Instant::now() + Duration::from_secs(6 * 60 * 60));
                     }
                     Ok(None) => {
-                        self.update_status = "Установлена последняя опубликованная версия".into()
+                        self.update_status = format!(
+                            "Установлена последняя версия ({}).",
+                            env!("CARGO_PKG_VERSION")
+                        );
+                        self.update_next_check =
+                            Some(Instant::now() + Duration::from_secs(6 * 60 * 60));
                     }
-                    Err(e) => self.update_status = format!("Не удалось проверить обновление: {e}"),
+                    Err(e) => {
+                        self.update_status = format!("Не удалось проверить обновление: {e}");
+                        self.update_next_check =
+                            Some(Instant::now() + Duration::from_secs(15 * 60));
+                    }
                 }
             }
             ctx.request_repaint_after(Duration::from_millis(100));
         }
-        if self.profile.auto_update
-            && self.update_ready.is_some()
-            && self.session.is_none()
+        let idle = self.session.is_none()
             && self.connecting.is_none()
             && !self.editing
-            && self.draft.is_empty()
+            && self.draft.is_empty();
+        if self.profile.auto_update
+            && idle
+            && self
+                .update_ready_at
+                .is_some_and(|at| at.elapsed() >= Duration::from_secs(8))
         {
             self.install_update(ctx);
         }
@@ -963,6 +1119,70 @@ impl App {
             });
     }
 
+    /// Visible update notification outside the settings screen.
+    fn update_banner(&mut self, ui: &mut egui::Ui) {
+        let light = self.profile.light_theme;
+        let auto = self.profile.auto_update;
+        let Some(version) = self.update_ready.as_ref().map(|p| p.version.clone()) else {
+            return;
+        };
+        let busy = self.session.is_some() || self.voice_channel.is_some();
+        let response = egui::Frame::new()
+            .fill(ui::accent(light).gamma_multiply(0.16))
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                ui::accent(light).gamma_multiply(0.55),
+            ))
+            .corner_radius(9)
+            .inner_margin(Margin::symmetric(10, 9))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui::icon_label(ui, ui::Icon::Download, 15.0, ui::accent(light));
+                    ui.label(
+                        RichText::new(format!("Доступно обновление {version}"))
+                            .size(12.5)
+                            .strong()
+                            .color(ui::accent(light)),
+                    );
+                });
+                ui.label(
+                    RichText::new(if busy {
+                        "Установится после завершения разговора"
+                    } else if auto {
+                        "Скачано. Перезапуск через несколько секунд…"
+                    } else {
+                        "Скачано. Нажмите, чтобы установить"
+                    })
+                    .size(11.5)
+                    .color(ui::muted(light)),
+                );
+            })
+            .response
+            .interact(Sense::click())
+            .on_hover_text(if busy {
+                "Откройте настройки обновлений"
+            } else if auto {
+                "Открыть настройки обновлений"
+            } else {
+                "Установить обновление и перезапустить ThodTalk"
+            });
+        if response.clicked() {
+            if busy || auto {
+                self.open_updates();
+            } else {
+                self.install_update(ui.ctx());
+            }
+        }
+        ui.add_space(8.0);
+    }
+
+    fn open_updates(&mut self) {
+        self.open_settings();
+        self.settings_tab = SETTINGS_TABS.len() - 1;
+    }
+
     fn sidebar_header(&mut self, ui: &mut egui::Ui) {
         let light = self.profile.light_theme;
         let title = match &self.session {
@@ -999,6 +1219,7 @@ impl App {
 
     fn sidebar_body(&mut self, ui: &mut egui::Ui) {
         let light = self.profile.light_theme;
+        self.update_banner(ui);
         if self.session.is_none() {
             if ui::nav_row(
                 ui,
@@ -2370,31 +2591,43 @@ impl App {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "Участник".into());
         let source = texture.size_vec2();
-        let max = egui::vec2(
-            (ctx.screen_rect().width() * 0.72).clamp(320.0, 1100.0),
-            (ctx.screen_rect().height() * 0.62).max(200.0),
-        );
-        let scale = (max.x / source.x).min(max.y / source.y).min(1.0);
         let mut hide = false;
-        egui::Window::new(format!("Демонстрация экрана · {name}"))
-            .id(egui::Id::new("screen-viewer"))
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.add(egui::Image::new((texture.id(), source * scale)).corner_radius(8));
-                ui.horizontal(|ui| {
-                    if ui.button("Отключиться").clicked() {
-                        hide = true;
-                    }
-                    ui.label(
-                        RichText::new("Демонстрация обновляется в реальном времени")
-                            .size(11.5)
-                            .color(ui::muted(light)),
-                    );
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("screen-viewer-native"),
+            egui::ViewportBuilder::default()
+                .with_title(format!("Демонстрация экрана · {name}"))
+                .with_inner_size([960.0, 600.0])
+                .with_min_inner_size([320.0, 240.0])
+                .with_resizable(true),
+            |ctx, _class| {
+                if ctx.input(|i| i.viewport().close_requested()) { hide = true; }
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+                    self.screen_fullscreen = false;
+                }
+                egui::TopBottomPanel::bottom("screen-controls").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("На весь экран").clicked() {
+                            self.screen_fullscreen = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                        }
+                        if ui.button("Отключиться").clicked() { hide = true; }
+                        ui.label(RichText::new("Escape — обычный размер окна").color(ui::muted(light)));
+                    });
                 });
-            });
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let max = ui.available_size();
+                    let scale = (max.x / source.x).min(max.y / source.y).max(0.01);
+                    ui.centered_and_justified(|ui| {
+                        ui.add(egui::Image::new((texture.id(), source * scale)));
+                    });
+                });
+                ctx.request_repaint_after(Duration::from_millis(33));
+            },
+        );
         if hide {
+            self.screen_fullscreen = false;
             self.stop_watching_screen(true);
         }
     }
@@ -2929,14 +3162,27 @@ impl App {
                                             }
                                         });
                                     } else {
-                                        let response = ui.add(
-                                            egui::Label::new(RichText::new(&m.text).size(14.5))
-                                                .wrap()
-                                                .sense(Sense::click()),
-                                        );
+                                        let mut text = m.text.as_str();
+                                        let output = egui::TextEdit::multiline(&mut text)
+                                            .id_salt(("message-text", m.id))
+                                            .font(egui::FontId::proportional(14.5))
+                                            .desired_width(f32::INFINITY)
+                                            .desired_rows(1)
+                                            .frame(false)
+                                            .show(ui);
+                                        let selected = output.cursor_range.map(|range| {
+                                            let [start, end] = range.sorted_cursors();
+                                            m.text.chars().skip(start.ccursor.index)
+                                                .take(end.ccursor.index - start.ccursor.index).collect::<String>()
+                                        }).filter(|text| !text.is_empty());
+                                        let response = output.response;
                                         let own = m.author_key == session.own_key();
                                         let can_delete_all = own || session.hosting();
                                         response.context_menu(|ui| {
+                                            if ui.button("Копировать").clicked() {
+                                                ui.ctx().copy_text(selected.clone().unwrap_or_else(|| m.text.clone()));
+                                                ui.close_menu();
+                                            }
                                             if own && ui.button("Редактировать").clicked() {
                                                 action = Some((m.id, 0));
                                                 ui.close_menu();
@@ -2952,6 +3198,12 @@ impl App {
                                                 ui.close_menu();
                                             }
                                         });
+                                        for word in m.text.split_whitespace() {
+                                            let url = word.trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '<' | '>' | '"' | ',' | '.' | ';'));
+                                            if url.starts_with("https://") || url.starts_with("http://") {
+                                                ui.hyperlink_to(url, url);
+                                            }
+                                        }
                                     }
                                 });
                             });
@@ -3093,30 +3345,6 @@ impl App {
                                 .clicked();
                         });
                         ui.add_space(10.0);
-                        ui::card(ui, light, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(ui::heading("Диагностика подключения", 15.0));
-                                if ui.button(if self.show_network_log { "Скрыть" } else { "Показать" }).clicked() {
-                                    self.show_network_log = !self.show_network_log;
-                                }
-                                if ui.button("Копировать").clicked() {
-                                    ui.ctx().copy_text(self.network_log.join("\n"));
-                                }
-                                if ui.button("Очистить").clicked() {
-                                    self.network_log.clear();
-                                }
-                            });
-                            if self.show_network_log {
-                                let mut text = self.network_log.join("\n");
-                                if text.is_empty() { text = "Событий пока нет".into(); }
-                                ui.add_sized(
-                                    [ui.available_width(), 150.0],
-                                    egui::TextEdit::multiline(&mut text)
-                                        .font(egui::TextStyle::Monospace)
-                                        .interactive(false),
-                                );
-                            }
-                        });
                     });
                 });
             });
@@ -3626,6 +3854,21 @@ impl App {
                                 .color(status_color),
                         );
                     }
+                    if let Some(update) = &self.update_ready {
+                        if !update.notes.trim().is_empty() {
+                            ui.add_space(6.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("update-notes")
+                                .max_height(160.0)
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(update.notes.trim())
+                                            .size(12.5)
+                                            .color(muted),
+                                    );
+                                });
+                        }
+                    }
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if self.update_rx.is_some() {
@@ -3656,7 +3899,7 @@ impl App {
                         ui,
                         light,
                         "Устанавливать автоматически",
-                        "Обновление применяется вне разговора, с перезапуском приложения.",
+                        "Проверка при запуске и каждые 6 часов. Обновление скачивается само и ставится вне разговора.",
                         |ui| {
                             ui::toggle(ui, &mut self.profile.auto_update);
                         },
@@ -3675,6 +3918,8 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.tray.poll(ctx, &mut self.allow_close);
+        ctx.request_repaint_after(Duration::from_millis(250));
         self.tick(ctx);
         self.dropped_files(ctx);
         self.drop_hint(ctx);
@@ -3740,8 +3985,8 @@ impl App {
         if self.update_rx.is_some() {
             return;
         }
-        self.update_started = true;
         self.update_status = "Проверяем GitHub и загружаем новую версию…".into();
+        self.update_next_check = Some(Instant::now() + Duration::from_secs(15 * 60));
         let root = self.store.root.clone();
         let (tx, rx) = mpsc::channel();
         self.update_rx = Some(rx);
@@ -3751,9 +3996,15 @@ impl App {
     }
     fn install_update(&mut self, ctx: &egui::Context) {
         if let Some(update) = self.update_ready.take() {
+            self.allow_close = true;
             match thodtalk::updater::install(&update) {
                 Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                Err(e) => self.update_status = format!("Обновление не установлено: {e}"),
+                Err(e) => {
+                    self.allow_close = false;
+                    self.update_ready_at = None;
+                    self.update_status = format!("Обновление не установлено: {e}");
+                    self.update_ready = Some(update);
+                }
             }
         }
     }
@@ -4032,11 +4283,15 @@ fn run() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("ThodTalk уже открыт с этим профилем"))?;
     let image = image::load_from_memory(include_bytes!(concat!(env!("OUT_DIR"), "/icon.png")))?
         .into_rgba8();
+    let icon_width = image.width();
+    let icon_height = image.height();
+    let icon_rgba = image.clone().into_raw();
     let icon = egui::IconData {
-        width: image.width(),
-        height: image.height(),
-        rgba: image.into_raw(),
+        width: icon_width,
+        height: icon_height,
+        rgba: icon_rgba.clone(),
     };
+    let tray = TrayController::new(icon_rgba, icon_width, icon_height)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_icon(icon)
@@ -4047,7 +4302,7 @@ fn run() -> anyhow::Result<()> {
     eframe::run_native(
         "ThodTalk",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, store, lock)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, store, lock, tray)))),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }

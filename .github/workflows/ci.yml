@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    env:
+      CMAKE_GENERATOR: MinGW Makefiles
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+      CFLAGS: '-std=c11'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils mingw-w64-x86_64-make make
+          path-type: inherit
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Test and build
+        shell: pwsh
+        run: |
+          $env:Path = "C:\msys64\mingw64\bin;$env:Path"
+          cargo test --locked
+          if ($LASTEXITCODE) { throw 'cargo test failed' }
+          cargo build --locked
+          if ($LASTEXITCODE) { throw 'cargo build failed' }

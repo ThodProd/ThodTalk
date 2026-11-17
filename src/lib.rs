@@ -3,7 +3,6 @@ pub mod audio;
 pub mod crypto;
 pub mod history;
 pub mod internet;
-mod lan;
 pub mod relay;
 pub mod session;
 pub mod share;

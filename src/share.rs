@@ -38,10 +38,10 @@ pub struct SourceInfo {
     pub source: Source,
 }
 
-const INTERVAL: Duration = Duration::from_millis(220);
+const INTERVAL: Duration = Duration::from_millis(350);
 /// Hard ceiling for one JPEG. Base64 grows it by ~33%; the encrypted payload
 /// limit is 256 KiB, so this leaves comfortable headroom.
-const MAX_BYTES: usize = 160_000;
+const MAX_BYTES: usize = 40_000;
 
 /// List monitors and top-level windows that can be shared.
 pub fn sources() -> Vec<SourceInfo> {
@@ -276,7 +276,7 @@ impl ScreenShare {
     pub fn start(source: Source) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        let (tx, frames) = mpsc::sync_channel(2);
+        let (tx, frames) = mpsc::sync_channel(1);
         let thread = std::thread::spawn(move || {
             let mut failures = 0u32;
             while !flag.load(Ordering::Relaxed) {
@@ -469,7 +469,7 @@ fn encode(width: i32, height: i32, pixels: Vec<u8>) -> Result<Frame> {
     let color = image::DynamicImage::ImageRgb8(image);
 
     // Try progressively lighter encodings until the frame fits the budget.
-    for (target, quality) in [(900u32, 55u8), (800, 48), (640, 40), (480, 32)] {
+    for (target, quality) in [(800u32, 45u8), (640, 38), (480, 30), (320, 24)] {
         let scale = (target as f32 / width as f32).min(1.0);
         let out_w = ((width as f32 * scale) as u32).max(2);
         let out_h = ((height as f32 * scale) as u32).max(2);

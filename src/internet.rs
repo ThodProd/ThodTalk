@@ -222,12 +222,12 @@ impl InternetHost {
         let endpoint = self.endpoint.clone();
         let self_token = self.token;
         self.runtime.spawn(async move {
-            let event = match tokio::time::timeout(Duration::from_secs(25), endpoint.online()).await {
+            let event = match tokio::time::timeout(Duration::from_secs(40), endpoint.online()).await {
                 Ok(()) => match internet_address(&endpoint.addr()) {
                     Ok(address) => PairEvent::Code(encode_address_code(&address, &self_token)),
                     Err(error) => PairEvent::Error(error.to_string()),
                 },
-                Err(_) => PairEvent::Error("Не удалось подключить сервер к интернет-relay за 25 секунд. Приглашение не создано. Проверьте интернет и повторите запуск сервера.".into()),
+                Err(_) => PairEvent::Error("Не удалось подключить сервер к интернет-relay за 40 секунд. Приглашение не создано. Проверьте интернет и повторите запуск сервера.".into()),
             };
             let _ = tx.send(event);
         });
@@ -250,7 +250,7 @@ async fn check_public_route(
         .bind()
         .await?;
     let result = tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(12), async {
+        result = tokio::time::timeout(Duration::from_secs(30), async {
             host.online().await;
             let connection = probe.connect(EndpointAddr::new(host.id()).with_relay_url(relay), ROUTE_ALPN).await?;
             let (mut send, mut recv) = connection.open_bi().await?;
@@ -259,7 +259,7 @@ async fn check_public_route(
             ensure!(recv.read_u8().await? == 1, "Relay не подтвердил передачу данных");
             connection.close(0u8.into(), b"route checked");
             Ok::<_, anyhow::Error>(())
-        }) => result.context("Relay не передаёт данные за 12 секунд").and_then(|result| result),
+        }) => result.context("Relay не передаёт данные за 30 секунд").and_then(|result| result),
         _ = async {
             while !cancel.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -386,18 +386,18 @@ impl InternetGuest {
         let mut stage = "установка QUIC-соединения";
         let mut last_error = String::new();
         let setup = runtime.block_on(async {
-            let dial = tokio::time::timeout(Duration::from_secs(25), async {
+            let dial = tokio::time::timeout(Duration::from_secs(45), async {
                 // QUIC authenticates the exact public key embedded in the invitation.
                 // Relay selection and DNS publication can finish shortly after
                 // the first dial. Keep retrying the same authenticated address
                 // instead of turning a transient miss into a hard timeout.
                 let quic = loop {
-                    match tokio::time::timeout(Duration::from_secs(6), endpoint.connect(address.clone(), ALPN)).await {
+                    match tokio::time::timeout(Duration::from_secs(10), endpoint.connect(address.clone(), ALPN)).await {
                         Ok(Ok(connection)) => break connection,
                         result => {
                             last_error = match result {
                                 Ok(Err(error)) => error.to_string(),
-                                Err(_) => "маршрут не ответил за 6 секунд".into(),
+                                Err(_) => "маршрут не ответил за 10 секунд".into(),
                                 _ => unreachable!(),
                             };
 
@@ -503,7 +503,10 @@ fn encode_address_code(address: &EndpointAddr, token: &[u8; 16]) -> String {
     format!("TT4:{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 fn parse_address_code(code: &str) -> Result<(EndpointAddr, [u8; 16])> {
-    let value = code.trim();
+    // Codes are often copied from a wrapped message and may contain line breaks.
+    // Base64 decoders reject a newline anywhere in the payload, so strip all
+    // whitespace before validating and decoding.
+    let value: String = code.chars().filter(|c| !c.is_whitespace()).collect();
     ensure!(value.len() <= 8192, "Слишком длинный код сервера");
     if let Some(encoded) = value.strip_prefix("TT4:") {
         return Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?)?);
@@ -560,6 +563,9 @@ mod tests {
         let (decoded, token) = parse_address_code(&code).unwrap();
         assert_eq!(decoded, address);
         assert_eq!(token, [7; 16]);
+        // A code copied from a wrapped chat message may contain line breaks.
+        let wrapped = format!("{}\r\n{}", &code[..100], &code[100..]);
+        assert_eq!(parse_address_code(&wrapped).unwrap().1, [7; 16]);
         assert_eq!(parse_code(&code).unwrap().0, ep.id());
         assert!(parse_address_code("TT4:broken").is_err());
         assert!(parse_address_code(&format!("TT4:{}", "A".repeat(8192))).is_err());

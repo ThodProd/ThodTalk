@@ -768,6 +768,12 @@ impl Session {
                     self.identity.save(&self.store)?;
                     self.send_profile()?;
                 }
+                Packet::Voice { .. } if self.group.is_none() => {
+                    // Voice is carried by QUIC datagrams and can arrive before
+                    // the reliable Welcome that installs the MLS group. Drop
+                    // it instead of closing the whole session.
+                    continue;
+                }
                 Packet::Content { data } | Packet::Voice { data } => {
                     let group = self.group.as_mut().context("Нет группы")?;
                     let (author, bytes) = match self.identity.receive_content(group, &data) {

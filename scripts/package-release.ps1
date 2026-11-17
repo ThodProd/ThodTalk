@@ -26,6 +26,87 @@ function Get-RelativePath([string]$Base, [string]$Path) {
     return [IO.Path]::GetFileName($Path)
 }
 
+function New-UpdateZip([string]$Stage, [string]$Destination) {
+    # ZipFile::CreateFromDirectory writes backslashes on .NET Framework. Old
+    # ThodTalk updaters reject such names, so create entries with forward slashes.
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $stageFull = [IO.Path]::GetFullPath($Stage).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $stream = [IO.File]::Open($Destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        $archive = New-Object System.IO.Compression.ZipArchive($stream, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+        try {
+            $files = Get-ChildItem -LiteralPath $stageFull -Recurse -File -Force | Sort-Object FullName
+            foreach ($file in $files) {
+                $relative = $file.FullName.Substring($stageFull.Length + 1).Replace('\', '/')
+                [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $archive,
+                    $file.FullName,
+                    $relative,
+                    [System.IO.Compression.CompressionLevel]::Optimal
+                )
+            }
+        } finally {
+            $archive.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+function Assert-UpdateZip([string]$Path, [string]$Version) {
+    # Mirrors the checks in src/updater.rs (and in 0.3.0-0.3.9) so a package
+    # that an older client cannot install never gets published.
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $reserved = @('CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9')
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        if ($zip.Entries.Count -gt 5000) { throw "Слишком много файлов в ZIP: $($zip.Entries.Count)" }
+        $names = @{}
+        $total = [uint64]0
+        foreach ($entry in $zip.Entries) {
+            $name = $entry.FullName
+            if ($name.Contains('\') -or $name.Contains(':') -or $name.StartsWith('/')) {
+                throw "Некорректный путь в ZIP: $name"
+            }
+            foreach ($part in $name.Split('/')) {
+                if ([string]::IsNullOrEmpty($part)) { continue }
+                if ($part -eq '.' -or $part -eq '..' -or $part.EndsWith(' ') -or $part.EndsWith('.')) {
+                    throw "Недопустимое имя в ZIP: $name"
+                }
+                $base = $part.Split('.')[0].ToUpperInvariant()
+                if ($reserved -contains $base) { throw "Зарезервированное имя в ZIP: $name" }
+            }
+            if ($names.ContainsKey($name)) { throw "Повтор пути в ZIP: $name" }
+            $names[$name] = $true
+            $total += [uint64]$entry.Length
+            if ($total -gt 300MB) { throw 'Распакованный ZIP слишком большой' }
+        }
+        if (!$names.ContainsKey('manifest.json')) { throw 'В ZIP нет manifest.json' }
+        if (!$names.ContainsKey('app/thodtalk.exe')) { throw 'В ZIP нет app/thodtalk.exe' }
+
+        $manifestEntry = $zip.GetEntry('manifest.json')
+        $reader = New-Object IO.StreamReader($manifestEntry.Open(), [Text.UTF8Encoding]::new($false))
+        try {
+            $manifest = $reader.ReadToEnd() | ConvertFrom-Json
+        } finally {
+            $reader.Dispose()
+        }
+        if ($manifest.id -ne 'thodtalk' -or
+            $manifest.schemaVersion -ne 1 -or
+            $manifest.hubApi -ne 1 -or
+            $manifest.version -ne $Version -or
+            $manifest.mode -ne 'standalone' -or
+            $manifest.platform -ne 'win-x64' -or
+            $manifest.launch.executable -ne 'app/thodtalk.exe') {
+            throw 'Некорректный manifest.json в ZIP'
+        }
+    } finally {
+        $zip.Dispose()
+    }
+}
+
 $root = Split-Path $PSScriptRoot -Parent
 $env:Path = "$env:USERPROFILE\.cargo\bin;" + [Environment]::GetEnvironmentVariable('Path','User') + ';' + [Environment]::GetEnvironmentVariable('Path','Machine')
 $env:CMAKE_GENERATOR = 'MinGW Makefiles'
@@ -128,14 +209,9 @@ try {
     $name = "thodtalk-$version-win-x64.zip"
     $zip = Join-Path $output $name
     if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    [System.IO.Compression.ZipFile]::CreateFromDirectory(
-        (Resolve-Path -LiteralPath $stage).Path,
-        $zip,
-        [System.IO.Compression.CompressionLevel]::Optimal,
-        $false
-    )
+    New-UpdateZip $stage $zip
     if (!(Test-Path -LiteralPath $zip)) { throw 'ZIP не создан' }
+    Assert-UpdateZip $zip $version
 
     $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
     $size = (Get-Item -LiteralPath $zip).Length
@@ -207,3 +283,4 @@ try {
 } finally {
     Pop-Location
 }
+

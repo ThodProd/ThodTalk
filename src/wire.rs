@@ -14,12 +14,16 @@ pub enum Packet {
     Welcome {
         recipient: u64,
         data: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        key: Vec<u8>,
     },
     Commit {
         data: Vec<u8>,
     },
     Content {
         data: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        targets: Vec<Vec<u8>>,
     },
     Voice {
         #[serde(with = "crate::wire::binary")]
@@ -64,6 +68,7 @@ mod tests {
     fn framing_roundtrip_rejects_oversize_and_truncation() {
         let packet = Packet::Content {
             data: vec![1, 2, 3],
+            targets: Vec::new(),
         };
         let mut bytes = Vec::new();
         write_packet(&mut bytes, &packet).unwrap();

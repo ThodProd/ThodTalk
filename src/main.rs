@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use eframe::egui;
 use eframe::egui::{Align, Frame, Layout, Margin, Rect, RichText, Sense, Vec2, pos2, vec2};
+use thodtalk::share::Quality;
 mod ui;
 use std::{
     sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, mpsc},
@@ -192,9 +193,12 @@ struct App {
     screen: Option<ScreenView>,
     screen_visible: bool,
     screen_fullscreen: bool,
-    last_screen_sent: std::time::Instant,
     screen_watch: Option<(Vec<u8>, String)>,
-    stream_viewers: std::collections::BTreeSet<Vec<u8>>,
+    screen_quality: Option<Quality>,
+    screen_feedback: Option<(Quality, Instant)>,
+    screen_watch_started: Instant,
+    screen_degraded_until: Option<Instant>,
+    stream_viewers: std::collections::BTreeMap<Vec<u8>, (Option<Quality>, Instant)>,
     share_picker: bool,
     share_sources: Vec<thodtalk::share::SourceInfo>,
     share_source: usize,
@@ -295,9 +299,12 @@ impl App {
             screen: None,
             screen_visible: true,
             screen_fullscreen: false,
-            last_screen_sent: std::time::Instant::now(),
             screen_watch: None,
-            stream_viewers: std::collections::BTreeSet::new(),
+            screen_quality: None,
+            screen_feedback: None,
+            screen_watch_started: Instant::now(),
+            screen_degraded_until: None,
+            stream_viewers: std::collections::BTreeMap::new(),
             share_picker: false,
             share_sources: Vec::new(),
             share_source: 0,
@@ -511,16 +518,13 @@ impl App {
             return;
         }
         self.stop_watching_screen(false);
-        self.screen_watch = Some((author.clone(), channel.clone()));
+        self.screen_watch = Some((author, channel));
+        self.screen_watch_started = Instant::now();
+        self.screen_feedback = None;
+        self.screen_degraded_until = None;
         self.screen = None;
         self.screen_visible = true;
-        if let Some(session) = &mut self.session {
-            let _ = session.send(Payload::ScreenWatch {
-                target: author,
-                channel,
-                watching: true,
-            });
-        }
+        self.send_screen_feedback();
         self.sound(thodtalk::sounds::Sound::ScreenViewerJoin);
     }
     /// Leave the stream. `cue` is false when leaving voice also closes the
@@ -535,12 +539,56 @@ impl App {
                 target: author,
                 channel,
                 watching: false,
+                quality: None,
             });
         }
         self.screen = None;
+        self.screen_feedback = None;
         self.screen_visible = false;
         if cue {
             self.sound(thodtalk::sounds::Sound::ScreenViewerLeave);
+        }
+    }
+
+    fn send_screen_feedback(&mut self) {
+        let (Some(session), Some((author, channel))) = (&mut self.session, &self.screen_watch)
+        else {
+            return;
+        };
+        let supports_quality = session.screen_routing
+            && session.members.get(author).is_some_and(|member| member.screen_quality_selectable);
+        if !supports_quality && self.screen_feedback.is_some() {
+            return;
+        }
+        let frame_age = self.screen.as_ref().map_or_else(
+            || self.screen_watch_started.elapsed(),
+            |view| view.updated.elapsed(),
+        );
+        if self.screen_watch_started.elapsed() > Duration::from_secs(3)
+            && frame_age > Duration::from_millis(1700)
+        {
+            self.screen_degraded_until = Some(Instant::now() + Duration::from_secs(15));
+        }
+        let stalled = self
+            .screen_degraded_until
+            .is_some_and(|until| Instant::now() < until);
+        let automatic = Quality::for_link(session.ping_ms, stalled);
+        let quality = self.screen_quality.unwrap_or(automatic);
+        let last = self.screen_feedback;
+        let resend = last.is_none_or(|(_, at)| at.elapsed() >= Duration::from_secs(5));
+        let changed = last.is_none_or(|(previous, _)| previous != quality);
+        let lowered = last.is_some_and(|(previous, _)| quality < previous);
+        if !resend && !(changed && (lowered || self.screen_quality.is_some())) {
+            return;
+        }
+        let request = Payload::ScreenWatch {
+            target: author.clone(),
+            channel: channel.clone(),
+            watching: true,
+            quality: supports_quality.then_some(quality),
+        };
+        if session.send(request).is_ok() {
+            self.screen_feedback = Some((quality, Instant::now()));
         }
     }
     /// Files dropped anywhere on the window are sent to the open text channel.
@@ -599,24 +647,38 @@ impl App {
             });
     }
     fn pump_screen(&mut self, ctx: &egui::Context) {
+        self.send_screen_feedback();
         // Outgoing: hand frames captured in the background to the session worker.
         let mut failed = None;
-        if let Some(share) = &self.share {
+        if let (Some(share), Some(session), Some(channel)) =
+            (&self.share, &mut self.session, &self.voice_channel)
+        {
+            let mut targets = std::collections::BTreeMap::<Quality, Vec<Vec<u8>>>::new();
+            if session.screen_routing {
+                for (viewer, (quality, _)) in &self.stream_viewers {
+                    targets
+                        .entry(quality.unwrap_or_default())
+                        .or_default()
+                        .push(viewer.clone());
+                }
+            } else {
+                targets.insert(Quality::Standard, Vec::new());
+            }
+            share.set_qualities(targets.keys().copied().collect());
             while let Ok(result) = share.frames.try_recv() {
                 match result {
-                    Ok(frame) => {
-                        let ping = self.session.as_ref().and_then(|s| s.ping_ms).unwrap_or(0);
-                        let interval = if ping >= 700 { 1500 } else if ping >= 350 { 750 } else { 350 };
-                        if self.last_screen_sent.elapsed() < Duration::from_millis(interval) {
-                            continue;
-                        }
-                        self.last_screen_sent = std::time::Instant::now();
-                        if let (Some(session), Some(channel)) =
-                            (&mut self.session, &self.voice_channel)
-                        {
-                            if let Err(error) =
-                                session.share_screen(channel, frame.width, frame.height, frame.data)
-                            {
+                    Ok(frames) => {
+                        for (quality, frame) in frames {
+                            let Some(viewers) = targets.get(&quality) else {
+                                continue;
+                            };
+                            if let Err(error) = session.share_screen(
+                                channel,
+                                frame.width,
+                                frame.height,
+                                frame.data,
+                                viewers.clone(),
+                            ) {
                                 self.error = error.to_string();
                             }
                         }
@@ -880,15 +942,20 @@ impl App {
         if let Some(message) = disconnect_log {
             self.network_log(message);
         }
-        for (viewer, channel, watching) in watch_events {
+        for (viewer, channel, watching, quality) in watch_events {
             if self.share.is_none() || self.voice_channel.as_deref() != Some(channel.as_str()) {
                 continue;
             }
             if watching {
-                self.stream_viewers.insert(viewer);
-                self.sound(thodtalk::sounds::Sound::ScreenViewerJoin);
-            } else {
-                self.stream_viewers.remove(&viewer);
+                // Legacy viewers send a join/leave notice only once.
+                let first = self
+                    .stream_viewers
+                    .insert(viewer, (quality, Instant::now()))
+                    .is_none();
+                if first {
+                    self.sound(thodtalk::sounds::Sound::ScreenViewerJoin);
+                }
+            } else if self.stream_viewers.remove(&viewer).is_some() {
                 self.sound(thodtalk::sounds::Sound::ScreenViewerLeave);
             }
         }
@@ -896,13 +963,14 @@ impl App {
             let gone: Vec<_> = self
                 .stream_viewers
                 .iter()
-                .filter(|viewer| {
-                    !self
-                        .session
-                        .as_ref()
-                        .is_some_and(|session| session.members.contains_key(*viewer))
+                .filter(|(viewer, (quality, seen))| {
+                    (quality.is_some() && seen.elapsed() > Duration::from_secs(25))
+                        || !self
+                            .session
+                            .as_ref()
+                            .is_some_and(|session| session.members.contains_key(*viewer))
                 })
-                .cloned()
+                .map(|(viewer, _)| viewer.clone())
                 .collect();
             for viewer in gone {
                 self.stream_viewers.remove(&viewer);
@@ -2564,21 +2632,27 @@ impl App {
 
     fn screen_window(&mut self, ctx: &egui::Context) {
         let light = self.profile.light_theme;
-        let Some(view) = &self.screen else {
+        let Some((author, _)) = &self.screen_watch else {
             return;
         };
-        if !self.screen_visible || view.updated.elapsed() > Duration::from_secs(3) {
+        if !self.screen_visible {
             return;
         }
-        let texture = view.texture.clone();
-        let author = view.author.clone();
+        let texture = self.screen.as_ref().map(|view| view.texture.clone());
+        let stalled = self
+            .screen
+            .as_ref()
+            .is_some_and(|view| view.updated.elapsed() > Duration::from_secs(3));
+        let supports_quality = self.session.as_ref().is_some_and(|session| {
+            session.screen_routing
+                && session.members.get(author).is_some_and(|member| member.screen_quality_selectable)
+        });
         let name = self
             .session
             .as_ref()
-            .and_then(|s| s.members.get(&author).map(|m| m.name.clone()))
+            .and_then(|s| s.members.get(author).map(|m| m.name.clone()))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "Участник".into());
-        let source = texture.size_vec2();
         let mut hide = false;
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("screen-viewer-native"),
@@ -2588,27 +2662,64 @@ impl App {
                 .with_min_inner_size([320.0, 240.0])
                 .with_resizable(true),
             |ctx, _class| {
-                if ctx.input(|i| i.viewport().close_requested()) { hide = true; }
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    hide = true;
+                }
                 if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
                     self.screen_fullscreen = false;
                 }
                 egui::TopBottomPanel::bottom("screen-controls").show(ctx, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button("На весь экран").clicked() {
                             self.screen_fullscreen = true;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
                         }
-                        if ui.button("Отключиться").clicked() { hide = true; }
-                        ui.label(RichText::new("Escape — обычный размер окна").color(ui::muted(light)));
+                        if ui.button("Отключиться").clicked() {
+                            hide = true;
+                        }
+                        if supports_quality {
+                            ui.label("Качество");
+                            let previous = self.screen_quality;
+                            egui::ComboBox::from_id_salt("viewer-quality")
+                                .selected_text(self.screen_quality.map_or("Авто", Quality::label))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.screen_quality, None, "Авто");
+                                    for quality in Quality::ALL {
+                                        ui.selectable_value(
+                                            &mut self.screen_quality,
+                                            Some(quality),
+                                            quality.label(),
+                                        );
+                                    }
+                                });
+                            if previous != self.screen_quality {
+                                self.screen_feedback = None;
+                                self.send_screen_feedback();
+                            }
+                        }
+                        if let Some(texture) = &texture {
+                            let [width, height] = texture.size();
+                            ui.label(
+                                RichText::new(format!("{width}×{height}")).color(ui::muted(light)),
+                            );
+                        }
+                        if stalled {
+                            ui.label("Ожидаем новые кадры…");
+                        }
                     });
                 });
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let max = ui.available_size();
-                    let scale = (max.x / source.x).min(max.y / source.y).max(0.01);
                     ui.centered_and_justified(|ui| {
-                        ui.add(egui::Image::new((texture.id(), source * scale)));
+                        if let Some(texture) = &texture {
+                            let source = texture.size_vec2();
+                            let max = ui.available_size();
+                            let scale = (max.x / source.x).min(max.y / source.y).max(0.01);
+                            ui.add(egui::Image::new((texture.id(), source * scale)));
+                        } else {
+                            ui.label("Ожидаем изображение…");
+                        }
                     });
                 });
                 ctx.request_repaint_after(Duration::from_millis(33));
@@ -4018,7 +4129,7 @@ fn screen_image(bytes: &[u8]) -> Option<egui::ColorImage> {
         .ok()?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(1920);
-    limits.max_image_height = Some(1200);
+    limits.max_image_height = Some(1920);
     limits.max_alloc = Some(32 * 1024 * 1024);
     reader.limits(limits);
     let image = reader.decode().ok()?.to_rgba8();

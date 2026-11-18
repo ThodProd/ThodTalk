@@ -529,18 +529,6 @@ fn replace_file(source: &Path, target: &Path, backup: &Path, relative: &Path) ->
 
 pub fn apply(plan: &Path, parent_pid: u32) -> Result<()> {
     let prepared: Prepared = serde_json::from_slice(&fs::read(plan)?)?;
-    let bytes = fs::read(&prepared.archive)?;
-    ensure!(
-        sha256(&bytes) == prepared.hash,
-        "Пакет изменился после загрузки"
-    );
-    let work = prepared.stage.parent().context("Нет каталога обновления")?;
-    let clean = work.join("verified");
-    let backup = work.join("backup");
-    let _ = fs::remove_dir_all(&clean);
-    let _ = fs::remove_dir_all(&backup);
-    fs::create_dir(&clean)?;
-    extract(&bytes, &clean, &prepared.version)?;
     #[cfg(windows)]
     unsafe {
         let handle = OpenProcess(0x00100000, 0, parent_pid);
@@ -550,17 +538,23 @@ pub fn apply(plan: &Path, parent_pid: u32) -> Result<()> {
             ensure!(result == 0, "Приложение не завершилось за две минуты");
         }
     }
-    let target_dir = prepared
-        .target
-        .parent()
-        .context("Нет каталога приложения")?;
-    fs::create_dir(&backup)?;
     let mut changed: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
-    // Installed layout: <root>/manifest.json + <root>/app/thodtalk.exe.
-    // Otherwise the executable is treated as self-contained and only it is replaced.
-    let installed = target_dir.file_name().is_some_and(|n| n == "app")
-        && target_dir.parent().is_some_and(|root| root.join("manifest.json").is_file());
     let result = (|| -> Result<()> {
+        let bytes = fs::read(&prepared.archive)?;
+        ensure!(sha256(&bytes) == prepared.hash, "Пакет изменился после загрузки");
+        let work = prepared.stage.parent().context("Нет каталога обновления")?;
+        let clean = work.join("verified");
+        let backup = work.join("backup");
+        let _ = fs::remove_dir_all(&clean);
+        let _ = fs::remove_dir_all(&backup);
+        fs::create_dir(&clean)?;
+        extract(&bytes, &clean, &prepared.version)?;
+        fs::create_dir(&backup)?;
+
+        let target_dir = prepared.target.parent().context("Нет каталога приложения")?;
+        // Portable copies can have any executable name and no manifest.
+        let installed = target_dir.file_name().is_some_and(|n| n == "app")
+            && target_dir.parent().is_some_and(|root| root.join("manifest.json").is_file());
         if installed {
             let mut files = Vec::new();
             collect(&clean.join("app"), Path::new(""), &mut files)?;
@@ -600,17 +594,15 @@ pub fn apply(plan: &Path, parent_pid: u32) -> Result<()> {
             let saved = replace_file(&source, &prepared.target, &backup, Path::new("thodtalk.exe"))?;
             changed.push((prepared.target.clone(), saved));
         }
+        std::process::Command::new(&prepared.target).spawn()?;
         Ok(())
     })();
     if let Err(e) = result {
         rollback(&changed);
-        let _ = std::process::Command::new(&prepared.target).spawn();
+        std::process::Command::new(&prepared.target).spawn().with_context(|| {
+            format!("{e:#}. Не удалось запустить предыдущую версию")
+        })?;
         return Err(e);
-    }
-    if let Err(e) = std::process::Command::new(&prepared.target).spawn() {
-        rollback(&changed);
-        let _ = std::process::Command::new(&prepared.target).spawn();
-        return Err(e.into());
     }
     Ok(())
 }

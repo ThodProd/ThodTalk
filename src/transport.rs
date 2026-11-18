@@ -51,6 +51,8 @@ impl Connection {
                 }
                 match incoming_tx.try_send(packet) {
                     Err(mpsc::TrySendError::Full(Ok(Packet::Voice { .. }))) => continue,
+                    Err(mpsc::TrySendError::Full(Ok(Packet::Content { targets, .. })))
+                        if !targets.is_empty() => continue,
                     Err(_) => break,
                     _ => {}
                 }
@@ -83,6 +85,8 @@ impl Connection {
         ensure!(self.outgoing.is_some(), "Соединение закрыто");
         match self.outgoing.as_ref().unwrap().try_send(packet) {
             Ok(()) | Err(mpsc::TrySendError::Full(Packet::Voice { .. })) => Ok(()),
+            Err(mpsc::TrySendError::Full(Packet::Content { targets, .. }))
+                if !targets.is_empty() => Ok(()),
             Err(_) => Err(anyhow::anyhow!(
                 "Соединение закрыто или очередь переполнена"
             )),
@@ -120,6 +124,7 @@ mod tests {
                 data: alice
                     .encrypt(&mut group_a, "Привет, друг!".as_bytes())
                     .unwrap(),
+                targets: Vec::new(),
             })
             .unwrap();
         let packet = server
@@ -127,7 +132,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
-        let Packet::Content { data } = packet else {
+        let Packet::Content { data, .. } = packet else {
             panic!("Unexpected packet");
         };
         assert_eq!(
@@ -137,6 +142,7 @@ mod tests {
         server
             .send(Packet::Content {
                 data: bob.encrypt(&mut group_b, b"hello back").unwrap(),
+                targets: Vec::new(),
             })
             .unwrap();
         let packet = client
@@ -144,7 +150,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
-        let Packet::Content { data } = packet else {
+        let Packet::Content { data, .. } = packet else {
             panic!("Unexpected packet");
         };
         assert_eq!(

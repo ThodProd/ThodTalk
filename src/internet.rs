@@ -2,7 +2,7 @@
 use crate::{relay::Relay, transport::Connection};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
+use iroh::{Endpoint, EndpointAddr, EndpointId, Watcher, endpoint::presets};
 use serde::{Deserialize, Serialize};
 use std::{
     sync::{
@@ -25,6 +25,8 @@ pub struct Invitation {
     pub address: EndpointAddr,
     pub owner_key: Vec<u8>,
     pub room: uuid::Uuid,
+    #[serde(default)]
+    pub screen_routing: bool,
 }
 pub enum PairEvent {
     Code(String),
@@ -52,10 +54,11 @@ fn internet_builder() -> iroh::endpoint::Builder {
     Endpoint::builder(presets::N0).transport_config(
         iroh::endpoint::QuicTransportConfig::builder()
             .max_idle_timeout(Some(
-                Duration::from_secs(15)
+                Duration::from_secs(35)
                     .try_into()
                     .expect("valid idle timeout"),
             ))
+            .keep_alive_interval(Duration::from_secs(4))
             .build(),
     )
 }
@@ -101,6 +104,7 @@ impl InternetHost {
                         relay.clone(),
                         done.clone(),
                     ))?;
+                    host.runtime.spawn(maintain_relay(host.endpoint.clone(), relay.clone()));
                     Ok(host)
                 })()
                 .with_context(|| format!("Интернет-маршрут {relay}"));
@@ -145,26 +149,20 @@ impl InternetHost {
                     };
 
                     if connection.alpn() == ROUTE_ALPN {
-                        let _ = tokio::time::timeout(Duration::from_secs(5), async {
-                            let (mut send, mut recv) = connection.accept_bi().await?;
-                            ensure!(recv.read_u8().await? == 1, "Неверный запрос маршрута");
-                            send.write_all(&[1]).await?;
-                            send.finish()?;
-                            let _ = send.stopped().await;
-                            Ok::<_, anyhow::Error>(())
-                        })
-                        .await;
-                        connection.close(0u8.into(), b"route checked");
+                        serve_route(connection).await;
                         return;
                     }
                     let setup = tokio::time::timeout(Duration::from_secs(30), async {
-                        ensure!(!gate.load(Ordering::SeqCst), "Вход закрыт");
                         let (mut send, mut recv) = connection.accept_bi().await?;
 
                         let mut supplied = [0u8; 16];
                         recv.read_exact(&mut supplied).await?;
-                        ensure!(bool::from(token.ct_eq(&supplied)), "Неверное приглашение");
-                        ensure!(!gate.load(Ordering::SeqCst), "Вход закрыт");
+                        if !bool::from(token.ct_eq(&supplied)) || gate.load(Ordering::SeqCst) {
+                            send.write_u32(0).await?;
+                            send.finish()?;
+                            let _ = tokio::time::timeout(Duration::from_secs(3), send.stopped()).await;
+                            anyhow::bail!("Вход закрыт или приглашение отклонено");
+                        }
                         let invitation = info
                             .read()
                             .ok()
@@ -215,6 +213,7 @@ impl InternetHost {
             address: self.endpoint.addr(),
             owner_key,
             room,
+            screen_routing: true,
         });
         let (tx, rx) = mpsc::channel();
         let endpoint = self.endpoint.clone();
@@ -222,7 +221,12 @@ impl InternetHost {
         self.runtime.spawn(async move {
             let event = match tokio::time::timeout(Duration::from_secs(40), endpoint.online()).await {
                 Ok(()) => match internet_address(&endpoint.addr()) {
-                    Ok(address) => PairEvent::Code(encode_address_code(&address, &self_token)),
+                    Ok(mut address) => {
+                        for relay in iroh::RelayMode::Default.relay_map().urls::<Vec<_>>() {
+                            address = address.with_relay_url(relay);
+                        }
+                        PairEvent::Code(encode_address_code(&address, &self_token))
+                    }
                     Err(error) => PairEvent::Error(error.to_string()),
                 },
                 Err(_) => PairEvent::Error("Не удалось подключить сервер к интернет-relay за 40 секунд. Приглашение не создано. Проверьте интернет и повторите запуск сервера.".into()),
@@ -236,14 +240,94 @@ async fn close_endpoint(endpoint: &Endpoint) {
     let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.close()).await;
 }
 
+async fn maintain_relay(endpoint: Endpoint, mut current: iroh::RelayUrl) {
+    let relays = iroh::RelayMode::Default.relay_map();
+    let mut status = endpoint.home_relay_status();
+    let mut last_check = std::time::Instant::now();
+    let mut failed_checks = 0;
+    loop {
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        if endpoint.is_closed() {
+            return;
+        }
+        if status.get().iter().any(|relay| relay.is_connected()) {
+            if failed_checks == 0 && last_check.elapsed() < Duration::from_secs(90) {
+                continue;
+            }
+            last_check = std::time::Instant::now();
+            if check_public_route(&endpoint, current.clone(), Arc::new(AtomicBool::new(false)))
+                .await
+                .is_ok()
+            {
+                failed_checks = 0;
+                continue;
+            }
+            failed_checks += 1;
+            if failed_checks < 2 {
+                continue;
+            }
+        }
+        // Probe alternates while iroh retries the current route. Retain the
+        // endpoint identity so existing invitations continue to work.
+        let mut probes = tokio::task::JoinSet::new();
+        for candidate in relays.urls::<Vec<_>>() {
+            if candidate != current {
+                probes.spawn(async move {
+                    probe_relay(candidate.clone()).await.ok().map(|_| candidate)
+                });
+            }
+        }
+        while let Some(result) = probes.join_next().await {
+            let Ok(Some(candidate)) = result else { continue; };
+            if (failed_checks >= 2 || !status.get().iter().any(|relay| relay.is_connected()))
+                && let Some(config) = relays.get(&candidate)
+            {
+                endpoint.insert_relay(candidate.clone(), config).await;
+                endpoint.remove_relay(&current).await;
+                crate::diagnostics::report("Резервный маршрут (relay)", Some(true), candidate.to_string());
+                current = candidate;
+                failed_checks = 0;
+                last_check = std::time::Instant::now();
+            }
+            break;
+        }
+    }
+}
+
 /// Isolated, relay-only round trip: does not join rooms or read user profiles.
 pub fn diagnostic_relay(relay: iroh::RelayUrl) -> Result<u128> {
-    let runtime = runtime()?;
-    let endpoint = runtime.block_on(Endpoint::builder(presets::Minimal)
+    runtime()?.block_on(probe_relay(relay))
+}
+
+async fn probe_relay(relay: iroh::RelayUrl) -> Result<u128> {
+    let endpoint = Endpoint::builder(presets::Minimal)
         .clear_ip_transports().relay_mode(iroh::RelayMode::custom([relay.clone()]))
-        .alpns(vec![ROUTE_ALPN.to_vec()]).bind())?;
-    let host = InternetHost::start_with(Relay::start("127.0.0.1:0".parse()?)?, runtime, endpoint)?;
-    host.runtime.block_on(check_public_route(&host.endpoint, relay, Arc::new(AtomicBool::new(false))))
+        .alpns(vec![ROUTE_ALPN.to_vec()]).bind().await?;
+    let result = tokio::select! {
+        result = check_public_route(&endpoint, relay, Arc::new(AtomicBool::new(false))) => result,
+        _ = async {
+            while let Some(incoming) = endpoint.accept().await {
+                if let Ok(connection) = incoming.await {
+                    serve_route(connection).await;
+                }
+            }
+        } => anyhow::bail!("Проверочный endpoint закрыт"),
+    };
+    close_endpoint(&endpoint).await;
+    result
+}
+
+async fn serve_route(connection: iroh::endpoint::Connection) {
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut send, mut recv) = connection.accept_bi().await?;
+        ensure!(recv.read_u8().await? == 1, "Неверный запрос маршрута");
+        send.write_all(&[1]).await?;
+        send.finish()?;
+        let _ = send.stopped().await;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+    connection.close(0u8.into(), b"route checked");
 }
 
 // This health exchange has no LAN/IP transport and cannot pass via loopback.
@@ -329,7 +413,7 @@ impl InternetGuest {
                     let runtime = runtime()?;
                     let builder = internet_builder();
                     let relays: Vec<_> = address.relay_urls().cloned().collect();
-                    let builder = if relays.is_empty() {
+                    let builder = if !relay_only || relays.is_empty() {
                         builder
                     } else {
                         builder.relay_mode(iroh::RelayMode::custom(relays))
@@ -405,60 +489,34 @@ impl InternetGuest {
                 // Relay selection and DNS publication can finish shortly after
                 // the first dial. Keep retrying the same authenticated address
                 // instead of turning a transient miss into a hard timeout.
-                let quic = loop {
+                loop {
                     attempt += 1;
-                    match tokio::time::timeout(Duration::from_secs(10), endpoint.connect(address.clone(), ALPN)).await {
-                        Ok(Ok(connection)) => break connection,
-                        result => {
-                            last_error = match result {
-                                Ok(Err(error)) => error.to_string(),
-                                Err(_) => "маршрут не ответил за 10 секунд".into(),
-                                _ => unreachable!(),
-                            };
+                    stage = "установка QUIC-соединения";
+                    let setup: Result<_> = async {
+                        let quic = tokio::time::timeout(Duration::from_secs(10), endpoint.connect(address.clone(), ALPN))
+                            .await.context("QUIC не ответил за 10 с")??;
+                        stage = "проверка приглашения и запуск сессии";
+                        let result = tokio::time::timeout(Duration::from_secs(8), guest_stream(&quic, &token))
+                            .await.context("Сервер не ответил на приглашение за 8 с").and_then(|result| result);
+                        match result {
+                            Ok((send, recv, invitation)) => Ok((quic, send, recv, invitation)),
+                            Err(error) => {
+                                quic.close(0u8.into(), b"retry");
+                                Err(error)
+                            }
+                        }
+                    }.await;
+                    match setup {
+                        Ok(value) => break Ok(value),
+                        Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied) => return Err(error),
+                        Err(error) => {
+                            last_error = format!("{error:#}");
 
                             crate::diagnostics::report("Подключение / QUIC", Some(false), format!("Попытка {attempt}, прошло {} с: {last_error}. Повтор через 750 мс", started.elapsed().as_secs()));
                             tokio::time::sleep(Duration::from_millis(750)).await;
                         }
                     }
-                };
-
-                stage = "проверка приглашения сервером";
-                crate::diagnostics::report("Подключение / этап", None, stage);
-                let (mut send, mut recv) = quic.open_bi().await?;
-
-                send.write_all(&token)
-                    .await
-                    .context("Передача приглашения")?;
-                send.finish()?;
-
-                let len =
-                    recv.read_u32()
-                        .await
-                        .context("Сервер не подтвердил приглашение")? as usize;
-                ensure!(len <= 16384, "Некорректное приглашение");
-                let mut bytes = vec![0; len];
-                recv.read_exact(&mut bytes).await?;
-                let invitation: Invitation = serde_json::from_slice(&bytes)?;
-
-                ensure!(
-                    invitation.owner_key.len() == 32,
-                    "Некорректный ключ владельца"
-                );
-                ensure!(
-                    recv.read_to_end(0).await?.is_empty(),
-                    "Лишние данные приглашения"
-                );
-
-                stage = "открытие потока сессии";
-                crate::diagnostics::report("Подключение / этап", None, stage);
-                let (mut send, mut recv) = quic.open_bi().await?;
-                send.write_all(&[3]).await?;
-
-                ensure!(
-                    recv.read_u8().await? == 3,
-                    "Сервер не подтвердил запуск сессии"
-                );
-                Ok::<_, anyhow::Error>((quic, send, recv, invitation))
+                }
             });
             tokio::select! {
                 result = dial => result.map_err(|_| {
@@ -499,6 +557,30 @@ impl InternetGuest {
             task,
         })
     }
+}
+
+async fn guest_stream(
+    quic: &iroh::endpoint::Connection,
+    token: &[u8; 16],
+) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream, Invitation)> {
+    let (mut send, mut recv) = quic.open_bi().await?;
+    send.write_all(token).await.context("Передача приглашения")?;
+    send.finish()?;
+    let len = recv.read_u32().await.context("Сервер не подтвердил приглашение")? as usize;
+    if len == 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Вход закрыт или приглашение отклонено").into());
+    }
+    ensure!(len <= 16384, "Некорректное приглашение");
+    let mut bytes = vec![0; len];
+    recv.read_exact(&mut bytes).await?;
+    let invitation: Invitation = serde_json::from_slice(&bytes)?;
+    ensure!(invitation.owner_key.len() == 32, "Некорректный ключ владельца");
+    ensure!(recv.read_to_end(0).await?.is_empty(), "Лишние данные приглашения");
+
+    let (mut send, mut recv) = quic.open_bi().await?;
+    send.write_all(&[3]).await?;
+    ensure!(recv.read_u8().await? == 3, "Сервер не подтвердил запуск сессии");
+    Ok((send, recv, invitation))
 }
 impl Drop for InternetGuest {
     fn drop(&mut self) {
@@ -657,18 +739,24 @@ async fn bridge(
     let outgoing = async {
         loop {
             let bytes = frame(&mut input).await?;
-            if matches!(
-                serde_json::from_slice::<Packet>(&bytes)?,
-                Packet::Voice { .. }
-            ) {
+            match serde_json::from_slice::<Packet>(&bytes)? {
+            Packet::Voice { .. } => {
                 // Oversized or congestion-dropped voice is never retried on the reliable stream.
                 let _ = connection.send_datagram(bytes.into());
-            } else {
+            }
+            Packet::Content { targets, .. } if !targets.is_empty() => {
+                // Screen frames expire behind queued reliable data. Reserve room
+                // for chat and membership transitions on the same connection.
+                if reliable_tx.capacity() >= 7 {
+                    let _ = reliable_tx.try_send(bytes);
+                }
+            }
+            _ => {
                 reliable_tx
                     .send(bytes)
                     .await
                     .context("Поток сообщений закрыт")?;
-            }
+            }}
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
@@ -710,8 +798,6 @@ async fn bridge(
     };
     let peer = format!("Участник QUIC / {}", connection.remote_id().fmt_short());
     let monitor = async {
-        let mut previous = (0u64, 0u64);
-        let mut last_rtt: Option<u128> = None;
         let mut previous_lost = 0;
         loop {
             let stats = connection.stats();
@@ -719,15 +805,13 @@ async fn bridge(
             let selected = paths.iter().find(|p| p.is_selected());
             let rtt = selected.as_ref().map(|p| p.rtt().as_millis());
             let route = selected.as_ref().map(|p| if p.is_relay() { "relay" } else { "прямой" }).unwrap_or("не выбран");
-            let jitter = rtt.zip(last_rtt).map(|(a,b)| a.abs_diff(b));
-            let rx = stats.udp_rx.bytes;
-            let tx = stats.udp_tx.bytes;
             let lost = stats.lost_packets;
             let sent = stats.sent_packets;
             let new_lost = lost.saturating_sub(previous_lost);
             previous_lost = lost;
-            crate::diagnostics::report(&peer, rtt.map(|ms| ms < 300 && new_lost == 0), format!("Маршрут: {route}; RTT: {} мс; изменение RTT: {} мс; RX/TX за интервал: {}/{} байт; всего: {rx}/{tx}; QUIC потери/отправлено: {lost}/{sent} (+{new_lost} потерь за интервал). RTT транспорта, не задержка голоса", rtt.map(|v| v.to_string()).unwrap_or_else(|| "нет измерения".into()), jitter.map(|v| v.to_string()).unwrap_or_else(|| "—".into()), rx.saturating_sub(previous.0), tx.saturating_sub(previous.1)));
-            previous = (rx, tx); last_rtt = rtt;
+            let rtt_text = rtt.map_or_else(|| "—".into(), |ms| format!("{ms} мс"));
+            crate::diagnostics::report(&peer, rtt.map(|ms| ms < 300 && new_lost == 0),
+                format!("{route} · RTT {rtt_text} · Потери QUIC {lost}/{sent} (+{new_lost} за 3 с)"));
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
     };

@@ -106,7 +106,7 @@ fn wait(clients: &mut [Client], seconds: u64, done: impl Fn(&[Client]) -> bool) 
     }
 }
 #[test]
-#[ignore = "Проверка публичного маршрута тремя процессами готового EXE, без LAN discovery"]
+#[ignore = "Проверка публичного маршрута четырьмя процессами готового EXE, без LAN discovery"]
 fn packaged_workers_public_chat_voice_and_kick() {
     let dir = tempfile::tempdir().unwrap();
     let mut clients = vec![Client::start(
@@ -122,8 +122,9 @@ fn packaged_workers_public_chat_voice_and_kick() {
     let connecting = Instant::now();
     clients.push(Client::start(&dir.path().join("a"), "Друг А", false, &code));
     clients.push(Client::start(&dir.path().join("b"), "Друг Б", false, &code));
-    wait(&mut clients, 35, |cs| cs.iter().all(|c| c.members() == 3));
-    eprintln!("Two guests connected in {:?}", connecting.elapsed());
+    clients.push(Client::start(&dir.path().join("c"), "Друг В", false, &code));
+    wait(&mut clients, 55, |cs| cs.iter().all(|c| c.members() == 4));
+    eprintln!("Three guests connected in {:?}", connecting.elapsed());
     assert_eq!(clients[0].state["hosting"], true);
     assert_eq!(clients[1].state["hosting"], false);
     assert_eq!(clients[2].state["hosting"], false);
@@ -145,7 +146,7 @@ fn packaged_workers_public_chat_voice_and_kick() {
     let key = clients[1].state["key"].clone();
     clients[0].send(json!({"Kick":key}));
     clients.remove(1);
-    wait(&mut clients, 15, |cs| cs.iter().all(|c| c.members() == 2));
+    wait(&mut clients, 15, |cs| cs.iter().all(|c| c.members() == 3));
     clients[1].send(json!({"Chat":{"channel":"Игры","text":"После кика"}}));
     wait(&mut clients, 15, |cs| cs.iter().all(|c| c.messages() == 2));
     assert_eq!(clients[0].state["code"].as_str().unwrap(), code);

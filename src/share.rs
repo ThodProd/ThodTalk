@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -38,10 +38,44 @@ pub struct SourceInfo {
     pub source: Source,
 }
 
-const INTERVAL: Duration = Duration::from_millis(350);
-/// Hard ceiling for one JPEG. Base64 grows it by ~33%; the encrypted payload
-/// limit is 256 KiB, so this leaves comfortable headroom.
-const MAX_BYTES: usize = 40_000;
+const CAPTURE_INTERVAL: Duration = Duration::from_millis(240);
+const MAX_BYTES: usize = 75_000;
+
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
+pub enum Quality {
+    Low,
+    #[default]
+    Standard,
+    High,
+}
+
+impl Quality {
+    pub const ALL: [Self; 3] = [Self::Low, Self::Standard, Self::High];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Низкое",
+            Self::Standard => "Среднее",
+            Self::High => "Высокое",
+        }
+    }
+
+    fn interval(self) -> Duration {
+        Duration::from_millis(match self {
+            Self::Low => 850,
+            Self::Standard => 450,
+            Self::High => 240,
+        })
+    }
+
+    pub fn for_link(ping_ms: Option<u32>, stalled: bool) -> Self {
+        match (ping_ms, stalled) {
+            (_, true) | (Some(500..), _) => Self::Low,
+            (Some(0..=175), false) => Self::High,
+            _ => Self::Standard,
+        }
+    }
+}
 
 /// List monitors and top-level windows that can be shared.
 pub fn sources() -> Vec<SourceInfo> {
@@ -268,7 +302,8 @@ pub fn exclude_from_capture(title: &str) -> bool {
 /// Background capture loop. Stop by dropping the value.
 pub struct ScreenShare {
     stop: Arc<AtomicBool>,
-    pub frames: mpsc::Receiver<Result<Frame>>,
+    qualities: Arc<Mutex<Vec<Quality>>>,
+    pub frames: mpsc::Receiver<Result<Vec<(Quality, Frame)>>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -276,12 +311,23 @@ impl ScreenShare {
     pub fn start(source: Source) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
+        let qualities = Arc::new(Mutex::new(Vec::new()));
+        let requested = Arc::clone(&qualities);
         let (tx, frames) = mpsc::sync_channel(1);
         let thread = std::thread::spawn(move || {
             let mut failures = 0u32;
+            let mut last = [None; Quality::ALL.len()];
             while !flag.load(Ordering::Relaxed) {
                 let started = Instant::now();
-                match capture(source) {
+                let due: Vec<_> = requested.lock().unwrap().iter().copied()
+                    .filter(|quality: &Quality| last[*quality as usize]
+                        .is_none_or(|at: Instant| at.elapsed() + Duration::from_millis(15) >= quality.interval()))
+                    .collect();
+                for &quality in &due {
+                    last[quality as usize] = Some(started);
+                }
+                if !due.is_empty() {
+                    match capture(source, &due) {
                     Ok(frame) => {
                         failures = 0;
                         let _ = tx.try_send(Ok(frame));
@@ -293,10 +339,11 @@ impl ScreenShare {
                             break;
                         }
                     }
+                    }
                 }
                 let elapsed = started.elapsed();
-                if elapsed < INTERVAL {
-                    let mut left = INTERVAL - elapsed;
+                if elapsed < CAPTURE_INTERVAL {
+                    let mut left = CAPTURE_INTERVAL - elapsed;
                     while left > Duration::from_millis(20) && !flag.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(20));
                         left -= Duration::from_millis(20);
@@ -309,9 +356,14 @@ impl ScreenShare {
         });
         Self {
             stop,
+            qualities,
             frames,
             thread: Some(thread),
         }
+    }
+
+    pub fn set_qualities(&self, qualities: Vec<Quality>) {
+        *self.qualities.lock().unwrap() = qualities;
     }
 }
 
@@ -330,9 +382,12 @@ impl Drop for ScreenShare {
 }
 
 #[cfg(windows)]
-fn capture(source: Source) -> Result<Frame> {
+fn capture(source: Source, qualities: &[Quality]) -> Result<Vec<(Quality, Frame)>> {
     let (width, height, pixels) = unsafe { grab(source)? };
-    encode(width, height, pixels)
+    let rgb: Vec<u8> = pixels.chunks_exact(4).flat_map(|px| [px[2], px[1], px[0]]).collect();
+    let image = image::RgbImage::from_raw(width as u32, height as u32, rgb)
+        .context("Некорректный размер кадра")?;
+    qualities.iter().map(|&quality| Ok((quality, encode(&image, quality)?))).collect()
 }
 
 #[cfg(windows)]
@@ -459,27 +514,22 @@ unsafe fn grab(source: Source) -> Result<(i32, i32, Vec<u8>)> {
     }
 }
 
-fn encode(width: i32, height: i32, pixels: Vec<u8>) -> Result<Frame> {
-    let rgb: Vec<u8> = pixels
-        .chunks_exact(4)
-        .flat_map(|px| [px[2], px[1], px[0]])
-        .collect();
-    let image = image::RgbImage::from_raw(width as u32, height as u32, rgb)
-        .context("Некорректный размер кадра")?;
-    let color = image::DynamicImage::ImageRgb8(image);
-
-    // Try progressively lighter encodings until the frame fits the budget.
-    for (target, quality) in [(800u32, 45u8), (640, 38), (480, 30), (320, 24)] {
-        let scale = (target as f32 / width as f32).min(1.0);
+fn encode(image: &image::RgbImage, preset: Quality) -> Result<Frame> {
+    let (width, height) = image.dimensions();
+    let (target, quality, budget) = match preset {
+        Quality::Low => (480, 38, 15_000),
+        Quality::Standard => (800, 50, 38_000),
+        Quality::High => (1280, 65, MAX_BYTES),
+    };
+    for (target, quality) in [(target, quality), (target, quality - 16), (target * 3 / 4, quality - 16), (320, 22), (200, 16)] {
+        let scale = (target as f32 / width.max(height) as f32).min(1.0);
         let out_w = ((width as f32 * scale) as u32).max(2);
         let out_h = ((height as f32 * scale) as u32).max(2);
-        let resized = color
-            .resize_exact(out_w, out_h, image::imageops::FilterType::Triangle)
-            .to_rgb8();
+        let resized = image::imageops::resize(image, out_w, out_h, image::imageops::FilterType::Triangle);
         let mut data = Vec::new();
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut data, quality)
             .encode_image(&resized)?;
-        if data.len() <= MAX_BYTES {
+        if data.len() <= budget {
             return Ok(Frame {
                 width: out_w,
                 height: out_h,
@@ -491,7 +541,7 @@ fn encode(width: i32, height: i32, pixels: Vec<u8>) -> Result<Frame> {
 }
 
 #[cfg(not(windows))]
-fn capture(_source: Source) -> Result<Frame> {
+fn capture(_source: Source, _qualities: &[Quality]) -> Result<Vec<(Quality, Frame)>> {
     anyhow::bail!("Демонстрация экрана поддерживается только в Windows")
 }
 
@@ -503,11 +553,12 @@ mod tests {
     #[ignore = "captures the real desktop"]
     fn captures_a_frame() {
         let share = ScreenShare::start(Source::Desktop);
-        let frame = share
+        share.set_qualities(vec![Quality::High]);
+        let (_, frame) = share
             .frames
             .recv_timeout(Duration::from_secs(5))
             .expect("кадр не пришёл")
-            .expect("захват экрана не удался");
+            .expect("захват экрана не удался").pop().unwrap();
         assert!(frame.width >= 2 && frame.height >= 2);
         assert!(!frame.data.is_empty() && frame.data.len() <= MAX_BYTES);
         image::load_from_memory(&frame.data).expect("кадр не декодируется");
@@ -534,8 +585,9 @@ mod tests {
             .into_iter()
             .filter(|s| matches!(s.source, Source::Window(_)))
         {
-            match capture(info.source) {
-                Ok(frame) => {
+            match capture(info.source, &[Quality::Standard]) {
+                Ok(mut frames) => {
+                    let (_, frame) = frames.pop().unwrap();
                     assert!(frame.width >= 2 && frame.height >= 2);
                     assert!(!frame.data.is_empty() && frame.data.len() <= MAX_BYTES);
                     image::load_from_memory(&frame.data).expect("кадр не декодируется");

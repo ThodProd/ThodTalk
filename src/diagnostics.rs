@@ -143,7 +143,7 @@ pub fn enable(enabled: bool, root: std::path::PathBuf) {
                             Ok(status) => (
                                 true,
                                 format!(
-                                    "DNS + TCP + TLS + HTTP: {} мс, HTTP {}. Это время HTTPS-ответа, не игровой ping и не проверка QUIC",
+                                    "Ответ сайта (HTTPS) {} мс · HTTP {}",
                                     start.elapsed().as_millis(),
                                     status
                                 ),
@@ -151,7 +151,7 @@ pub fn enable(enabled: bool, root: std::path::PathBuf) {
                             Err(e) => (
                                 false,
                                 format!(
-                                    "HTTPS недоступен: {e}. Проверьте интернет, DNS, VPN и фильтрацию HTTPS; причина блокировки не установлена"
+                                    "Сайт недоступен (HTTPS) · {e}"
                                 ),
                             ),
                         };
@@ -163,10 +163,10 @@ pub fn enable(enabled: bool, root: std::path::PathBuf) {
                                 Some(result.is_ok()),
                                 match result {
                                     Ok(ms) => format!(
-                                        "QUIC через relay: ответ на контрольный пакет за {ms} мс. Два тестовых endpoint на этом ПК, без прямого маршрута; это не RTT до друга"
+                                        "Тест передачи через relay (QUIC) · {ms} мс"
                                     ),
                                     Err(e) => format!(
-                                        "Двусторонний QUIC-обмен не подтверждён: {e:#}. HTTPS может работать при неработающей передаче relay"
+                                        "Проверка передачи через relay (QUIC) не прошла · {e:#}"
                                     ),
                                 },
                             );
@@ -178,35 +178,79 @@ pub fn enable(enabled: bool, root: std::path::PathBuf) {
         }
     });
 }
+fn status(entry: &Entry) -> &'static str {
+    match entry.ok {
+        Some(true) => "Работает",
+        Some(false) => "Есть проблема",
+        None => "Событие",
+    }
+}
+
+fn heading(section: &str) -> String {
+    for (prefix, label) in [
+        ("Relay HTTPS / ", "Ответ сайта relay (HTTPS)"),
+        ("Relay обмен / ", "Передача через relay (QUIC)"),
+        ("QUIC проверка / ", "Выбор маршрута сервера (QUIC)"),
+        ("Участник QUIC / ", "Связь с участником (QUIC)"),
+    ] {
+        if let Some(id) = section.strip_prefix(prefix) {
+            let id = id.strip_prefix("https://").unwrap_or(id).trim_end_matches('/');
+            return format!("{label} · {id}");
+        }
+    }
+    match section {
+        "MLS / сессия" => "Защищённая комната (MLS)".into(),
+        "Worker" => "Сетевой процесс (worker)".into(),
+        _ => section.into(),
+    }
+}
+
 pub fn window(ctx: &egui::Context, open: &mut bool) {
     if !*open {
         return;
     }
-    ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("debug-terminal"), egui::ViewportBuilder::default().with_title("ThodTalk — терминал отладки").with_inner_size([960.0, 760.0]), |ctx, _| {
+    ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("debug-terminal"), egui::ViewportBuilder::default().with_title("Диагностика ThodTalk").with_inner_size([780.0, 540.0]), |ctx, _| {
         if ctx.input(|i| i.viewport().close_requested()) { *open = false; }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(egui::Color32::from_rgb(15, 20, 30)).inner_margin(18)).show(ctx, |ui| {
             ui.visuals_mut().override_text_color = Some(egui::Color32::from_rgb(215, 225, 235));
-            ui.heading("THODTALK  /  ТЕРМИНАЛ ОТЛАДКИ");
-            ui.label("Живые измерения • Relay каждые 60–100 с • QUIC каждые 3 с • журнал в памяти");
-            ui.label("OK подтверждает только указанную проверку. Устаревшие измерения не подтверждают текущую связь.");
-            ui.label("Высокий RTT: сравните прямой/relay маршрут и HTTPS. Дальний relay, VPN, Wi-Fi и очереди трафика — возможные причины, не установленный диагноз.");
             let state = STATE.get_or_init(Default::default).lock().unwrap();
+            ui.horizontal(|ui| {
+                ui.heading("Диагностика связи");
+                if ui.button("Скопировать всё").clicked() {
+                    use std::fmt::Write;
+                    let mut text = format!("ThodTalk {} · диагностика\n\nТекущие проверки\n", env!("CARGO_PKG_VERSION"));
+                    for (entry, time) in state.current.values() {
+                        let age = time.map(|t| t.elapsed().as_secs()).unwrap_or_default();
+                        let _ = writeln!(text, "−{age} с · {} · {} · {}", status(entry), heading(&entry.section), entry.detail);
+                    }
+                    text.push_str("\nЖурнал\n");
+                    for (entry, time) in state.history.iter().rev() {
+                        let _ = writeln!(text, "−{} с · {} · {} · {}", time.elapsed().as_secs(), status(entry), heading(&entry.section), entry.detail);
+                    }
+                    ctx.copy_text(text);
+                }
+            });
+            ui.label("HTTPS — ответ сайта · QUIC — передача данных · RTT — время туда и обратно");
+            ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for (entry, time) in state.current.values() {
                     let age = time.map(|t| t.elapsed().as_secs()).unwrap_or(0);
                     let stale = age > if entry.section.starts_with("Relay") { 120 } else { 15 };
                     let color = if stale { egui::Color32::GRAY } else { match entry.ok { Some(true) => egui::Color32::from_rgb(85, 220, 150), Some(false) => egui::Color32::from_rgb(255, 115, 105), None => egui::Color32::from_rgb(245, 200, 95) } };
-                    egui::Frame::new().fill(egui::Color32::from_rgb(25, 33, 46)).inner_margin(10).corner_radius(6).show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.label(egui::RichText::new(format!("{}  {}  • {} с назад", if stale { "СТАРЫЕ ДАННЫЕ" } else { match entry.ok { Some(true) => "OK", Some(false) => "ОШИБКА / ВНИМАНИЕ", None => "ЭТАП" } }, entry.section, age)).color(color).strong());
-                        ui.label(&entry.detail);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(heading(&entry.section)).strong());
+                        ui.label(egui::RichText::new(if stale { "Устарело" } else { status(entry) }).color(color));
+                        ui.label(egui::RichText::new(format!("{age} с назад")).weak());
                     });
-                    ui.add_space(6.0);
+                    ui.label(&entry.detail);
+                    ui.add_space(5.0);
                 }
-                ui.separator(); ui.heading("Хронология (последние 250 событий)");
-                for (entry, time) in state.history.iter().rev() {
-                    ui.label(format!("−{} с  [{}] {}", time.elapsed().as_secs(), entry.section, entry.detail));
-                }
+                ui.separator();
+                ui.collapsing(format!("Журнал · {}", state.history.len()), |ui| {
+                    for (entry, time) in state.history.iter().rev() {
+                        ui.label(format!("−{} с · {} · {}", time.elapsed().as_secs(), heading(&entry.section), entry.detail));
+                    }
+                });
             });
         });
         ctx.request_repaint_after(Duration::from_secs(1));

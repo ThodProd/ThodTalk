@@ -23,6 +23,7 @@ struct Peer {
     connection: Connection,
     admitted: bool,
     requested: bool,
+    key: Vec<u8>,
     since: std::time::Instant,
     last_activity: std::time::Instant,
 }
@@ -51,6 +52,7 @@ impl Relay {
                                 connection,
                                 admitted: false,
                                 requested: false,
+                                key: Vec::new(),
                                 since: std::time::Instant::now(),
                                 last_activity: std::time::Instant::now(),
                             },
@@ -70,13 +72,14 @@ impl Relay {
                         }
                     };
                     match packet {
-                        Ok(Packet::Welcome { recipient, data }) => {
+                        Ok(Packet::Welcome { recipient, data, key }) => {
                             if let Some(peer) = peers.get_mut(&recipient) {
                                 if peer.requested && !peer.admitted {
                                     peer.admitted = peer
                                         .connection
-                                        .send(Packet::Welcome { recipient, data })
+                                        .send(Packet::Welcome { recipient, data, key: Vec::new() })
                                         .is_ok();
+                                    peer.key = key;
                                 }
                             }
                         }
@@ -89,7 +92,8 @@ impl Relay {
                             | Packet::Voice { .. }),
                         ) => {
                             for (&id, peer) in &peers {
-                                if peer.admitted && peer.connection.send(packet.clone()).is_err() {
+                                if peer.admitted && addressed_to(&packet, &peer.key)
+                                    && peer.connection.send(packet.clone()).is_err() {
                                     failed.push(id);
                                 }
                             }
@@ -107,7 +111,7 @@ impl Relay {
                     // Guests send a session probe every three seconds. Do not
                     // leave a dead membership around for QUIC's PTO-dependent
                     // transport timeout after a process/computer disappears.
-                    if (peer.admitted && peer.last_activity.elapsed() > Duration::from_secs(15))
+                    if (peer.admitted && peer.last_activity.elapsed() > Duration::from_secs(20))
                         || (!peer.admitted && peer.since.elapsed() > Duration::from_secs(60))
                     {
                         departed.push(id);
@@ -158,6 +162,7 @@ impl Relay {
                     for (&id, peer) in &peers {
                         if id != sender
                             && peer.admitted
+                            && addressed_to(&packet, &peer.key)
                             && peer.connection.send(packet.clone()).is_err()
                         {
                             departed.push(id);
@@ -179,6 +184,13 @@ impl Relay {
             stop,
             worker: Some(worker),
         })
+    }
+}
+
+fn addressed_to(packet: &Packet, key: &[u8]) -> bool {
+    match packet {
+        Packet::Content { targets, .. } => targets.is_empty() || targets.iter().any(|target| target == key),
+        _ => true,
     }
 }
 
@@ -226,6 +238,7 @@ mod tests {
             .send(Packet::Welcome {
                 recipient: connection,
                 data: welcome,
+                key: bob.public_key(),
             })
             .unwrap();
         let received = client
@@ -240,6 +253,7 @@ mod tests {
         client
             .send(Packet::Content {
                 data: bob.encrypt(&mut b, b"secret").unwrap(),
+                targets: Vec::new(),
             })
             .unwrap();
         let received = relay
@@ -248,7 +262,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
             .unwrap();
-        let Packet::Content { data } = received else {
+        let Packet::Content { data, .. } = received else {
             panic!("Expected content");
         };
         assert_eq!(alice.receive(&mut a, &data).unwrap().unwrap(), b"secret");

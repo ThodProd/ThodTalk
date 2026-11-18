@@ -76,12 +76,16 @@ pub enum Payload {
     /// Announced when someone starts or stops sharing a screen in a voice channel.
     ScreenState {
         channel: Option<String>,
+        #[serde(default)]
+        quality_selectable: bool,
     },
     /// Sent by a viewer to the owner of the stream they joined or left.
     ScreenWatch {
         target: Vec<u8>,
         channel: String,
         watching: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quality: Option<crate::share::Quality>,
     },
     FileStart {
         id: uuid::Uuid,
@@ -108,6 +112,8 @@ pub struct Member {
     /// Voice channel in which this member is currently sharing their screen.
     #[serde(default)]
     pub screen: Option<String>,
+    #[serde(default)]
+    pub screen_quality_selectable: bool,
 }
 const FILE_CHUNK: usize = 150 * 1024;
 struct PendingFile {
@@ -131,6 +137,8 @@ enum Link {
     Host(InternetHost),
     Guest(InternetGuest),
 }
+pub type ScreenWatchEvent = (Vec<u8>, String, bool, Option<crate::share::Quality>);
+
 pub struct Session {
     link: Link,
     identity: Identity,
@@ -149,7 +157,8 @@ pub struct Session {
     /// Latest screen frame: author, channel, width, height, JPEG bytes.
     pub screen_in: Option<(Vec<u8>, String, u32, u32, Vec<u8>)>,
     /// Viewer join/leave notices addressed to this client's own stream.
-    pub screen_watch_in: Vec<(Vec<u8>, String, bool)>,
+    pub screen_watch_in: Vec<ScreenWatchEvent>,
+    screen_receiving: Option<(Vec<u8>, String)>,
     screen_rate: BTreeMap<Vec<u8>, std::time::Instant>,
     last_screen_announce: std::time::Instant,
     file_out: Option<PendingFile>,
@@ -207,6 +216,7 @@ impl Session {
             voice_in: Vec::new(),
             screen_in: None,
             screen_watch_in: Vec::new(),
+            screen_receiving: None,
             screen_rate: BTreeMap::new(),
             last_screen_announce: std::time::Instant::now(),
             file_out: None,
@@ -260,6 +270,7 @@ impl Session {
             voice_in: Vec::new(),
             screen_in: None,
             screen_watch_in: Vec::new(),
+            screen_receiving: None,
             screen_rate: BTreeMap::new(),
             last_screen_announce: std::time::Instant::now(),
             file_out: None,
@@ -284,6 +295,13 @@ impl Session {
         match &self.link {
             Link::Host(host) => &host.relay.owner,
             Link::Guest(guest) => &guest.connection,
+        }
+    }
+
+    pub fn screen_routing(&self) -> bool {
+        match &self.link {
+            Link::Host(_) => true,
+            Link::Guest(guest) => guest.invitation.screen_routing,
         }
     }
     pub fn hosting(&self) -> bool {
@@ -379,6 +397,7 @@ impl Session {
             muted: false,
             deafened: false,
             screen: None,
+            screen_quality_selectable: false,
         });
         member.name = self.profile.name.clone();
         member.avatar = self.profile.avatar.clone();
@@ -404,6 +423,18 @@ impl Session {
         Ok(())
     }
     pub fn send(&mut self, payload: Payload) -> Result<()> {
+        if let Payload::ScreenWatch { target, channel, watching, .. } = &payload {
+            let next = watching.then(|| (target.clone(), channel.clone()));
+            if next != self.screen_receiving {
+                self.screen_in = None;
+                self.screen_rate.clear();
+                self.screen_receiving = next;
+            }
+        }
+        self.send_to(payload, Vec::new())
+    }
+
+    fn send_to(&mut self, payload: Payload, targets: Vec<Vec<u8>>) -> Result<()> {
         let payload = match payload {
             Payload::Voice { channel, data } => {
                 self.voice_sequence += 1;
@@ -426,6 +457,7 @@ impl Session {
                 | Payload::Heartbeat { .. }
                 | Payload::Probe { .. }
                 | Payload::Screen { .. }
+                | Payload::ScreenWatch { .. }
                 | Payload::FileChunk { .. }
         ) {
             self.identity.save(&self.store)?;
@@ -434,7 +466,7 @@ impl Session {
             .send(if matches!(payload, Payload::VoiceFrame { .. }) {
                 Packet::Voice { data }
             } else {
-                Packet::Content { data }
+                Packet::Content { data, targets }
             })?;
         if let Payload::VoiceState {
             channel,
@@ -478,7 +510,7 @@ impl Session {
         )?;
         Ok(())
     }
-    pub fn screen(&mut self, channel: &str, width: u32, height: u32, data: Vec<u8>) -> Result<()> {
+    pub fn screen(&mut self, channel: &str, width: u32, height: u32, data: Vec<u8>, targets: Vec<Vec<u8>>) -> Result<()> {
         ensure!(valid_channel(channel), "Неизвестный голосовой канал");
         ensure!(
             (2..=4096).contains(&width) && (2..=4096).contains(&height),
@@ -488,12 +520,12 @@ impl Session {
             !data.is_empty() && data.len() <= 170 * 1024,
             "Кадр экрана слишком большой"
         );
-        self.send(Payload::Screen {
+        self.send_to(Payload::Screen {
             channel: channel.into(),
             width,
             height,
             data,
-        })
+        }, targets)
     }
     /// Announce that the local user started or stopped sharing. This is what
     /// makes the stream clickable for everyone else in the voice channel.
@@ -502,11 +534,14 @@ impl Session {
             ensure!(valid_channel(channel), "Неизвестный голосовой канал");
         }
         let own = self.own_key();
+        let quality_selectable = channel.is_some() && self.screen_routing();
         if let Some(member) = self.members.get_mut(&own) {
             member.screen = channel.map(str::to_string);
+            member.screen_quality_selectable = quality_selectable;
         }
         self.send(Payload::ScreenState {
             channel: channel.map(str::to_string),
+            quality_selectable,
         })?;
         self.last_screen_announce = std::time::Instant::now();
         Ok(())
@@ -682,10 +717,6 @@ impl Session {
             self.last_probe = std::time::Instant::now();
         }
         if !self.hosting() {
-            ensure!(
-                self.last_owner.elapsed().as_secs() < 15,
-                "Сервер больше не отвечает. Сессия закрыта"
-            );
             if self.group.is_some() && self.last_probe.elapsed().as_secs() >= 3 {
                 self.nonce = self.nonce.wrapping_add(1);
                 self.send(Payload::Probe { nonce: self.nonce })?;
@@ -717,17 +748,17 @@ impl Session {
                     connection,
                     package,
                 } if self.hosting() => {
-                    let key = self.identity.package_key(&package);
-                    if self.closed
-                        || key.as_ref().is_err()
-                        || key
-                            .as_ref()
-                            .is_ok_and(|k| self.banned.contains(k) || self.members.contains_key(k))
+                    let group = self.group.as_mut().context("Нет группы")?;
+                    let Ok(key) = self.identity.package_key(&package) else {
+                        self.connection().send(Packet::Disconnect { connection })?;
+                        continue;
+                    };
+                    if self.closed || self.banned.contains(&key)
+                        || group.members().any(|member| member.signature_key == key)
                     {
                         self.connection().send(Packet::Disconnect { connection })?;
                         continue;
                     }
-                    let group = self.group.as_mut().context("Нет группы")?;
                     // No application-level member cap. Entry is controlled by
                     // `closed`, bans and MLS key validation.
                     let old: Vec<_> = group.members().map(|m| m.index).collect();
@@ -746,6 +777,7 @@ impl Session {
                     self.connection().send(Packet::Welcome {
                         recipient: connection,
                         data: welcome,
+                        key,
                     })?;
                     self.send_profile()?;
                 }
@@ -779,7 +811,9 @@ impl Session {
                     // it instead of closing the whole session.
                     continue;
                 }
-                Packet::Content { data } | Packet::Voice { data } => {
+                Packet::Content { ref targets, .. } if !targets.is_empty()
+                    && !targets.contains(&self.own_key()) => continue,
+                Packet::Content { data, .. } | Packet::Voice { data } => {
                     let group = self.group.as_mut().context("Нет группы")?;
                     let (author, bytes) = match self.identity.receive_content(group, &data) {
                         Ok(value) => value,
@@ -788,6 +822,9 @@ impl Session {
                             continue;
                         }
                     };
+                    if author == self.owner {
+                        self.last_owner = std::time::Instant::now();
+                    }
                     let payload: Payload = match serde_json::from_slice(&bytes) {
                         Ok(value) => value,
                         Err(_) => {
@@ -801,12 +838,17 @@ impl Session {
                             | Payload::Heartbeat { .. }
                             | Payload::Probe { .. }
                             | Payload::Screen { .. }
+                            | Payload::ScreenWatch { .. }
                             | Payload::FileChunk { .. }
                     ) {
                         self.identity.save(&self.store)?;
                     }
                     match payload {
                         Payload::Probe { nonce } => {
+                            if author == self.owner {
+                                self.confirmed = true;
+                                self.status = "Подключено · сквозное шифрование MLS".into();
+                            }
                             if self.hosting() || author == self.owner {
                                 self.send(Payload::Heartbeat { nonce })?;
                             }
@@ -817,7 +859,7 @@ impl Session {
                                     let ms = sent.elapsed().as_millis();
                                     let name = self.members.get(&author).map(|m| m.name.as_str()).unwrap_or("участник");
                                     let short = author.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>();
-                                    crate::diagnostics::report(format!("Участник / {name} ({short})"), Some(ms < 300), format!("Прикладной RTT: {ms} мс. Запрос владельца → участник → владелец, включая MLS и обработку приложения"));
+                                    crate::diagnostics::report(format!("Участник / {name} ({short})"), Some(ms < 300), format!("Ответ приложения (RTT) · {ms} мс"));
                                 }
                             }
                             if author == self.owner && nonce == self.nonce {
@@ -880,6 +922,7 @@ impl Session {
                                 muted: false,
                                 deafened: false,
                                 screen: None,
+                                screen_quality_selectable: false,
                             });
                             entry.name = name;
                             entry.avatar = avatar;
@@ -986,6 +1029,11 @@ impl Session {
                             height,
                             data,
                         } => {
+                            if !self.screen_receiving.as_ref().is_some_and(|(target, watched_channel)| {
+                                target == &author && watched_channel == &channel
+                            }) {
+                                continue;
+                            }
                             if !valid_channel(&channel)
                                 || !(2..=4096).contains(&width)
                                 || !(2..=4096).contains(&height)
@@ -1006,7 +1054,7 @@ impl Session {
                                 .insert(author.clone(), std::time::Instant::now());
                             self.screen_in = Some((author, channel, width, height, data));
                         }
-                        Payload::ScreenState { channel } => {
+                        Payload::ScreenState { channel, quality_selectable } => {
                             if channel
                                 .as_deref()
                                 .is_some_and(|channel| !valid_channel(channel))
@@ -1014,6 +1062,7 @@ impl Session {
                                 continue;
                             }
                             if let Some(member) = self.members.get_mut(&author) {
+                                member.screen_quality_selectable = channel.is_some() && quality_selectable;
                                 member.screen = channel.clone();
                             }
                             if channel.is_none()
@@ -1029,6 +1078,7 @@ impl Session {
                             target,
                             channel,
                             watching,
+                            quality,
                         } => {
                             if target != self.own_key()
                                 || author == target
@@ -1045,7 +1095,7 @@ impl Session {
                             if !sharing || self.screen_watch_in.len() >= 64 {
                                 continue;
                             }
-                            self.screen_watch_in.push((author, channel, watching));
+                            self.screen_watch_in.push((author, channel, watching, quality));
                         }
                         Payload::FileStart {
                             id,
@@ -1146,6 +1196,12 @@ impl Session {
                 _ => anyhow::bail!("Неожиданный пакет протокола"),
             }
         }
+        if !self.hosting() {
+            ensure!(
+                self.last_owner.elapsed().as_secs() < if self.confirmed { 35 } else { 45 },
+                "Сервер больше не отвечает. Сессия закрыта"
+            );
+        }
         if self.last_file_sweep.elapsed() > std::time::Duration::from_secs(10) {
             self.last_file_sweep = std::time::Instant::now();
             self.files_in
@@ -1162,6 +1218,7 @@ impl Session {
             {
                 let _ = self.send(Payload::ScreenState {
                     channel: Some(channel),
+                    quality_selectable: self.screen_routing(),
                 });
                 self.last_screen_announce = std::time::Instant::now();
             }
@@ -1254,7 +1311,7 @@ mod tests {
     }
 
     #[test]
-    fn screen_frame_reaches_guest() {
+    fn screen_frames_follow_each_viewers_requested_quality() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("guest");
         let mut host = Session::host_with(
@@ -1266,64 +1323,63 @@ mod tests {
             InternetHost::local,
         )
         .unwrap();
-        let guest = |h: &Session| {
+        let guest = |h: &Session, name: &str| {
             let Link::Host(network) = &h.link else {
                 unreachable!()
             };
             Session::from_guest(
-                Store::open(root.clone()).unwrap(),
+                Store::open(root.join(name)).unwrap(),
                 Profile {
-                    name: "Друг".into(),
+                    name: name.into(),
                     ..Default::default()
                 },
                 network.local_guest().unwrap(),
             )
             .unwrap()
         };
-        let mut guests = vec![guest(&host)];
+        let mut guests = vec![guest(&host, "Первый"), guest(&host, "Второй")];
         pump(&mut host, &mut guests, |h, gs| {
-            h.members.len() == 2 && gs[0].ready()
+            h.members.len() == 3 && gs.iter().all(Session::ready)
         });
 
         let frame = vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4];
         host.set_screen(Some("Общий")).unwrap();
         pump(&mut host, &mut guests, |h, gs| {
-            gs[0]
-                .members
-                .get(&h.own_key())
-                .is_some_and(|member| member.screen.as_deref() == Some("Общий"))
+            gs.iter().all(|guest| guest.members.get(&h.own_key())
+                .is_some_and(|member| member.screen.as_deref() == Some("Общий")))
         });
         let host_key = host.own_key();
-        let guest_key = guests[0].own_key();
-        guests[0]
-            .send(Payload::ScreenWatch {
+        use crate::share::Quality;
+        for (guest, quality) in guests.iter_mut().zip([Quality::Low, Quality::High]) {
+            guest.send(Payload::ScreenWatch {
                 target: host_key.clone(),
                 channel: "Общий".into(),
                 watching: true,
+                quality: Some(quality),
             })
             .unwrap();
-        pump(&mut host, &mut guests, |h, _| {
-            h.screen_watch_in.iter().any(|(viewer, channel, watching)| {
-                viewer == &guest_key && channel == "Общий" && *watching
+        }
+        pump(&mut host, &mut guests, |h, gs| {
+            gs.iter().zip([Quality::Low, Quality::High]).all(|(guest, quality)| {
+                h.screen_watch_in.contains(&(guest.own_key(), "Общий".into(), true, Some(quality)))
             })
         });
-        assert!(
-            host.screen_watch_in
-                .iter()
-                .any(|(_, channel, watching)| { channel == "Общий" && *watching })
-        );
+        for (guest, (width, height)) in guests.iter().zip([(320, 180), (1280, 720)]) {
+            host.screen("Общий", width, height, frame.clone(), vec![guest.own_key()]).unwrap();
+        }
+        pump(&mut host, &mut guests, |_, gs| gs.iter().all(|guest| guest.screen_in.is_some()));
+        for (guest, dimensions) in guests.iter_mut().zip([(320, 180), (1280, 720)]) {
+            let (author, channel, width, height, data) = guest.screen_in.take().unwrap();
+            assert_eq!(author, host_key);
+            assert_eq!(channel, "Общий");
+            assert_eq!((width, height), dimensions);
+            assert_eq!(data, frame);
+        }
         host.set_screen(None).unwrap();
         pump(&mut host, &mut guests, |_, gs| {
-            gs[0].members.values().all(|member| member.screen.is_none())
+            gs.iter().all(|guest| guest.members.values().all(|member| member.screen.is_none()))
         });
-        host.screen("Общий", 320, 180, frame.clone()).unwrap();
-        pump(&mut host, &mut guests, |_, gs| gs[0].screen_in.is_some());
-        let (author, channel, width, height, data) = guests[0].screen_in.clone().unwrap();
-        assert_eq!(author, host.own_key());
-        assert_eq!(channel, "Общий");
-        assert_eq!((width, height), (320, 180));
-        assert_eq!(data, frame);
-        assert!(host.screen("Общий", 0, 10, frame).is_err());
+        assert!(host.screen("Общий", 0, 10, frame, Vec::new()).is_err());
     }
 
     #[test]

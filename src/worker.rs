@@ -56,6 +56,7 @@ enum Request {
         height: u32,
         #[serde(with = "crate::wire::binary")]
         data: Vec<u8>,
+        targets: Vec<Vec<u8>>,
     },
     ScreenState {
         channel: Option<String>,
@@ -76,7 +77,7 @@ enum Event {
         #[serde(with = "crate::wire::binary")]
         data: Vec<u8>,
     },
-    ScreenWatch(Vec<(Vec<u8>, String, bool)>),
+    ScreenWatch(Vec<crate::session::ScreenWatchEvent>),
     Error(String),
     Fatal(String),
 }
@@ -91,6 +92,7 @@ struct Snapshot {
     code: String,
     closed: bool,
     ping_ms: Option<u32>,
+    screen_routing: bool,
 }
 pub struct ViewHistory {
     pub messages: Vec<Message>,
@@ -108,10 +110,11 @@ pub struct SessionProxy {
     pub code: String,
     pub closed: bool,
     pub ping_ms: Option<u32>,
+    pub screen_routing: bool,
     pub invite: Option<()>,
     pub voice_in: Vec<(Vec<u8>, String, Vec<u8>)>,
     pub screen_in: Option<(Vec<u8>, String, u32, u32, Vec<u8>)>,
-    pub screen_watch_in: Vec<(Vec<u8>, String, bool)>,
+    pub screen_watch_in: Vec<crate::session::ScreenWatchEvent>,
 }
 fn read<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> Result<T> {
     let mut line = Vec::new();
@@ -227,6 +230,7 @@ impl SessionProxy {
             code: String::new(),
             closed: false,
             ping_ms: None,
+            screen_routing: false,
             invite: None,
             voice_in: Vec::new(),
             screen_in: None,
@@ -255,11 +259,14 @@ impl SessionProxy {
         Ok(result)
     }
     fn request(&self, request: Request) -> Result<()> {
-        self.requests
+        match self.requests
             .as_ref()
             .context("Соединение закрыто")?
             .try_send(request)
-            .map_err(|_| anyhow::anyhow!("Рабочий процесс занят или завершён"))
+        {
+            Ok(()) | Err(mpsc::TrySendError::Full(Request::Screen { .. })) => Ok(()),
+            Err(_) => anyhow::bail!("Рабочий процесс занят или завершён"),
+        }
     }
     fn apply(&mut self, event: Event) -> Result<()> {
         match event {
@@ -279,6 +286,7 @@ impl SessionProxy {
                 self.code = s.code;
                 self.closed = s.closed;
                 self.ping_ms = s.ping_ms;
+                self.screen_routing = s.screen_routing;
                 self.invite = self.hosting.then_some(());
             }
             Event::Voice(frames) => {
@@ -362,12 +370,14 @@ impl SessionProxy {
         width: u32,
         height: u32,
         data: Vec<u8>,
+        targets: Vec<Vec<u8>>,
     ) -> Result<()> {
         self.request(Request::Screen {
             channel: channel.into(),
             width,
             height,
             data,
+            targets,
         })
     }
     pub fn set_screen(&mut self, channel: Option<&str>) -> Result<()> {
@@ -434,6 +444,7 @@ fn snapshot(session: &Session) -> Snapshot {
         code: session.code.clone(),
         closed: session.closed,
         ping_ms: session.ping_ms,
+        screen_routing: session.screen_routing(),
     }
 }
 fn revision(session: &Session) -> u64 {
@@ -520,7 +531,8 @@ pub fn run() -> Result<()> {
                     width,
                     height,
                     data,
-                } => session.screen(&channel, width, height, data),
+                    targets,
+                } => session.screen(&channel, width, height, data, targets),
                 Request::ScreenState { channel } => session.set_screen(channel.as_deref()),
                 Request::Kick(key) => session.kick(&key),
                 Request::Ban(key) => session.ban(&key),

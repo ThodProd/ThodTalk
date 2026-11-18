@@ -31,6 +31,8 @@ enum Request {
     Chat {
         channel: String,
         text: String,
+        #[serde(default)]
+        reply_to: Option<uuid::Uuid>,
     },
     Edit {
         id: uuid::Uuid,
@@ -87,7 +89,7 @@ struct Snapshot {
     hosting: bool,
     ready: bool,
     members: Vec<(Vec<u8>, Member)>,
-    history: Vec<Message>,
+    history: Option<Vec<Message>>,
     status: String,
     code: String,
     closed: bool,
@@ -279,7 +281,9 @@ impl SessionProxy {
                 self.hosting = s.hosting;
                 self.ready = s.ready;
                 self.members = s.members.into_iter().collect();
-                self.history.messages = s.history;
+                if let Some(history) = s.history {
+                    self.history.messages = history;
+                }
                 if self.status != s.status { crate::diagnostics::report("MLS / сессия", Some(s.ready), &s.status); }
                 if !s.hosting { if let Some(ms) = s.ping_ms { crate::diagnostics::report("Связь / прикладной RTT до владельца", Some(ms < 300), format!("{ms} мс — зашифрованный запрос и ответ, включая обработку приложения")); } }
                 self.status = s.status;
@@ -358,10 +362,11 @@ impl SessionProxy {
     pub fn send(&mut self, payload: Payload) -> Result<()> {
         self.request(Request::Payload(payload))
     }
-    pub fn chat(&mut self, channel: &str, text: &str) -> Result<()> {
+    pub fn chat(&mut self, channel: &str, text: &str, reply_to: Option<uuid::Uuid>) -> Result<()> {
         self.request(Request::Chat {
             channel: channel.into(),
             text: text.into(),
+            reply_to,
         })
     }
     pub fn share_screen(
@@ -419,7 +424,7 @@ impl Drop for SessionProxy {
         let _ = self.child.wait();
     }
 }
-fn snapshot(session: &Session) -> Snapshot {
+fn snapshot(session: &Session, include_history: bool) -> Snapshot {
     Snapshot {
         key: session.own_key(),
         hosting: session.hosting(),
@@ -429,17 +434,23 @@ fn snapshot(session: &Session) -> Snapshot {
             .iter()
             .map(|(k, m)| (k.clone(), m.clone()))
             .collect(),
-        history: session
-            .history
-            .messages
-            .iter()
-            .rev()
-            .take(300)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect(),
+        history: include_history.then(|| {
+            let mut counts = BTreeMap::new();
+            let mut messages = Vec::new();
+            let mut remaining = MAX_LINE / 2;
+            for message in session.history.messages.iter().rev() {
+                let count = counts.entry(message.channel.as_str()).or_insert(0);
+                // JSON escapes control characters up to six bytes each.
+                let size = (message.text.len() + message.file.as_ref().map_or(0, |file| file.name.len())) * 6 + 1024;
+                if *count < 300 && size <= remaining {
+                    *count += 1;
+                    remaining -= size;
+                    messages.push(message.clone());
+                }
+            }
+            messages.reverse();
+            messages
+        }),
         status: session.status.clone(),
         code: session.code.clone(),
         closed: session.closed,
@@ -450,17 +461,7 @@ fn snapshot(session: &Session) -> Snapshot {
 fn revision(session: &Session) -> u64 {
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     session.members.hash(&mut hash);
-    session.history.messages.len().hash(&mut hash);
-    // Track the visible window so edits and deletions refresh the UI.
-    for message in session.history.messages.iter().rev().take(300) {
-        message.id.hash(&mut hash);
-        message.text.hash(&mut hash);
-        message.channel.hash(&mut hash);
-        message.edited.hash(&mut hash);
-        message.file.hash(&mut hash);
-        message.timestamp_ms.hash(&mut hash);
-        message.image.hash(&mut hash);
-    }
+    session.history.revision().hash(&mut hash);
     session.status.hash(&mut hash);
     session.code.hash(&mut hash);
     session.closed.hash(&mut hash);
@@ -510,8 +511,9 @@ pub fn run() -> Result<()> {
         }
     };
     session.poll()?;
-    write(&Event::State(snapshot(&session)), &mut output)?;
+    write(&Event::State(snapshot(&session, true)), &mut output)?;
     let mut last = revision(&session);
+    let mut last_history = session.history.revision();
     loop {
         for _ in 0..64 {
             let Ok(request) = rx.try_recv() else {
@@ -519,7 +521,7 @@ pub fn run() -> Result<()> {
             };
             let result = match request {
                 Request::Shutdown => return Ok(()),
-                Request::Chat { channel, text } => session.chat(&channel, &text),
+                Request::Chat { channel, text, reply_to } => session.chat_with_reply(&channel, &text, reply_to),
                 Request::Edit { id, text } => session.edit_chat(id, &text),
                 Request::Delete { id, everywhere } => session.delete_chat(id, everywhere),
                 Request::Payload(payload) => session.send(payload),
@@ -576,8 +578,10 @@ pub fn run() -> Result<()> {
         }
         let next = revision(&session);
         if next != last {
-            write(&Event::State(snapshot(&session)), &mut output)?;
+            let history = session.history.revision();
+            write(&Event::State(snapshot(&session, history != last_history)), &mut output)?;
             last = next;
+            last_history = history;
         }
         std::thread::sleep(Duration::from_millis(10));
     }

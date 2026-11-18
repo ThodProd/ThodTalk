@@ -69,7 +69,11 @@ impl Client {
             assert!(v.get("Fatal").is_none(), "{}", v["Fatal"]);
             assert!(v.get("Error").is_none(), "{}", v["Error"]);
             if let Some(s) = v.get("State") {
+                let previous_history = self.state.get_mut("history").map_or(Value::Null, Value::take);
                 self.state = s.clone();
+                if self.state["history"].is_null() {
+                    self.state["history"] = previous_history;
+                }
             }
             if let Some(frames) = v.get("Voice").and_then(Value::as_array) {
                 self.voices += frames.len();
@@ -130,6 +134,10 @@ fn packaged_workers_public_chat_voice_and_kick() {
     assert_eq!(clients[2].state["hosting"], false);
     clients[1].send(json!({"Chat":{"channel":"Общий","text":"Проверка публичного маршрута"}}));
     wait(&mut clients, 15, |cs| cs.iter().all(|c| c.messages() == 1));
+    let original = clients[1].state["history"][0]["id"].clone();
+    clients[2].send(json!({"Chat":{"channel":"Общий","text":"Ответ", "reply_to": original}}));
+    wait(&mut clients, 15, |cs| cs.iter().all(|c| c.messages() == 2
+        && c.state["history"][1]["reply_to"] == original));
     let mut encoder =
         opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip).unwrap();
     let samples: Vec<i16> = (0..960)
@@ -148,7 +156,7 @@ fn packaged_workers_public_chat_voice_and_kick() {
     clients.remove(1);
     wait(&mut clients, 15, |cs| cs.iter().all(|c| c.members() == 3));
     clients[1].send(json!({"Chat":{"channel":"Игры","text":"После кика"}}));
-    wait(&mut clients, 15, |cs| cs.iter().all(|c| c.messages() == 2));
+    wait(&mut clients, 15, |cs| cs.iter().all(|c| c.messages() == 3));
     assert_eq!(clients[0].state["code"].as_str().unwrap(), code);
     assert_eq!(clients[0].state["closed"], true);
 }

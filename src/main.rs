@@ -3,6 +3,9 @@ use eframe::egui;
 use eframe::egui::{Align, Frame, Layout, Margin, Rect, RichText, Sense, Vec2, pos2, vec2};
 use thodtalk::share::Quality;
 mod ui;
+mod share_ui;
+#[cfg(windows)]
+mod share_outline;
 use std::{
     sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, mpsc},
     time::{Duration, Instant},
@@ -151,6 +154,12 @@ struct App {
     connecting: Option<mpsc::Receiver<anyhow::Result<Session>>>,
     code: String,
     draft: String,
+    draft_before_edit: Option<String>,
+    channel_drafts: std::collections::BTreeMap<String, String>,
+    unread_channels: std::collections::BTreeMap<String, usize>,
+    chat_search: String,
+    chat_search_visible: bool,
+    reply_message: Option<uuid::Uuid>,
     editing_message: Option<uuid::Uuid>,
     focus_composer: bool,
     channel: String,
@@ -164,7 +173,10 @@ struct App {
     inputs: Vec<String>,
     outputs: Vec<String>,
     member_textures: std::collections::BTreeMap<Vec<u8>, (Vec<u8>, egui::TextureHandle)>,
-    archives: Option<Vec<(String, thodtalk::history::History)>>,
+    archives: Option<Vec<(uuid::Uuid, String, thodtalk::history::History)>>,
+    archive_search: String,
+    archive_count: usize,
+    archive_clear: Option<ArchiveClear>,
     cancel_connect: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     brand: egui::TextureHandle,
     copied_until: Option<std::time::Instant>,
@@ -188,6 +200,8 @@ struct App {
     last_hosting: bool,
     share: Option<thodtalk::share::ScreenShare>,
     share_info: Option<thodtalk::share::SourceInfo>,
+    #[cfg(windows)]
+    share_outline: Option<share_outline::ShareOutline>,
     share_hud_user_moved: bool,
     share_hud_seq: u64,
     screen: Option<ScreenView>,
@@ -200,6 +214,7 @@ struct App {
     screen_degraded_until: Option<Instant>,
     stream_viewers: std::collections::BTreeMap<Vec<u8>, (Option<Quality>, Instant)>,
     share_picker: bool,
+    share_windows_tab: bool,
     share_sources: Vec<thodtalk::share::SourceInfo>,
     share_source: usize,
     file_preview: Option<(uuid::Uuid, String, u64)>,
@@ -212,6 +227,20 @@ struct ScreenView {
     texture: egui::TextureHandle,
     author: Vec<u8>,
     updated: std::time::Instant,
+}
+
+#[derive(Clone, Copy)]
+enum ArchiveClear {
+    Room(uuid::Uuid),
+    All,
+}
+
+#[derive(Clone, Copy)]
+enum MessageAction {
+    Edit,
+    DeleteLocal,
+    DeleteForEveryone,
+    Reply,
 }
 impl Drop for App {
     fn drop(&mut self) {
@@ -252,6 +281,12 @@ impl App {
             connecting: None,
             code: String::new(),
             draft: String::new(),
+            draft_before_edit: None,
+            channel_drafts: Default::default(),
+            unread_channels: Default::default(),
+            chat_search: String::new(),
+            chat_search_visible: false,
+            reply_message: None,
             editing_message: None,
             focus_composer: false,
             channel: "Общий".into(),
@@ -266,6 +301,9 @@ impl App {
             outputs,
             member_textures: Default::default(),
             archives: None,
+            archive_search: String::new(),
+            archive_count: 0,
+            archive_clear: None,
             cancel_connect: None,
             brand: texture(
                 &cc.egui_ctx,
@@ -294,6 +332,8 @@ impl App {
             last_hosting: false,
             share: None,
             share_info: None,
+            #[cfg(windows)]
+            share_outline: None,
             share_hud_user_moved: false,
             share_hud_seq: 0,
             screen: None,
@@ -306,6 +346,7 @@ impl App {
             screen_degraded_until: None,
             stream_viewers: std::collections::BTreeMap::new(),
             share_picker: false,
+            share_windows_tab: false,
             share_sources: Vec::new(),
             share_source: 0,
             file_preview: None,
@@ -464,7 +505,8 @@ impl App {
             return;
         }
         self.share_sources = thodtalk::share::sources();
-        self.share_source = 0;
+        self.share_source = share_ui::first_source(&self.share_sources, false);
+        self.share_windows_tab = false;
         self.share_picker = true;
     }
     fn start_share(&mut self) {
@@ -477,6 +519,10 @@ impl App {
             return;
         }
         self.stop_watching_screen(false);
+        #[cfg(windows)]
+        {
+            self.share_outline = Some(share_outline::ShareOutline::new(info.source, &self.share_sources));
+        }
         self.share = Some(thodtalk::share::ScreenShare::start(info.source));
         self.share_info = Some(info);
         self.share_hud_user_moved = false;
@@ -493,6 +539,10 @@ impl App {
     }
     fn stop_share(&mut self) {
         let was_sharing = self.share.take().is_some();
+        #[cfg(windows)]
+        {
+            self.share_outline = None;
+        }
         self.share_info = None;
         self.share_hud_user_moved = false;
         if was_sharing {
@@ -826,6 +876,15 @@ impl App {
                     Ok(session) => {
                         self.network_log("Рукопожатие завершено, сессия открыта");
                         self.session = Some(session);
+                        self.unread_channels.clear();
+                        self.channel_drafts.clear();
+                        self.draft.clear();
+                        self.reply_message = None;
+                        self.editing_message = None;
+                        self.draft_before_edit = None;
+                        self.archive_clear = None;
+                        self.chat_search.clear();
+                        self.chat_search_visible = false;
                         self.last_disconnect_time = None;
                         self.reconnect_attempts = 0;
                         self.code.clear();
@@ -856,13 +915,25 @@ impl App {
                 disconnected = true;
             }
             watch_events = std::mem::take(&mut session.screen_watch_in);
+            let mut received = false;
+            if session.history.messages.last().map(|m| m.id) != old_message {
+                let messages = &session.history.messages;
+                let start = old_message.map_or(Some(0), |id| {
+                    messages.iter().rposition(|message| message.id == id).map(|index| index + 1)
+                });
+                if let Some(start) = start {
+                    let own = session.own_key();
+                    for message in &messages[start..] {
+                        if message.author_key == own { continue; }
+                        received = true;
+                        if message.channel != self.channel || self.editing {
+                            *self.unread_channels.entry(message.channel.clone()).or_default() += 1;
+                        }
+                    }
+                }
+            }
             if self.profile.sounds && !self.deafened {
-                if session
-                    .history
-                    .messages
-                    .last()
-                    .is_some_and(|m| Some(m.id) != old_message && m.author_key != session.own_key())
-                {
+                if received {
                     thodtalk::sounds::play(thodtalk::sounds::Sound::Received);
                 }
                 if self.voice_channel.is_some() {
@@ -1073,33 +1144,28 @@ impl App {
         }
     }
     fn load_archives(&mut self) {
-        let result = (|| -> anyhow::Result<Vec<(String, thodtalk::history::History)>> {
+        use thodtalk::history::History;
+        self.archive_count = 0;
+        let result = History::saved_rooms(&self.store).map(|rooms| {
+            self.archive_count = rooms.len();
             let mut histories = Vec::new();
-            for entry in std::fs::read_dir(&self.store.root)? {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if let Some(id) = name
-                    .strip_prefix("history-")
-                    .and_then(|s| s.strip_suffix(".bin"))
-                    .and_then(|s| uuid::Uuid::parse_str(s).ok())
-                {
-                    let history = thodtalk::history::History::open(&self.store, id)?;
-                    let title = history
-                        .messages
-                        .last()
-                        .map(|m| {
-                            format!(
-                                "{} · {}",
-                                m.display_name,
-                                messages_count(history.messages.len())
-                            )
-                        })
-                        .unwrap_or_else(|| "Пустая переписка".into());
-                    histories.push((format!("{} · {}", title, &id.to_string()[..8]), history));
+            for room in rooms {
+                match History::open(&self.store, room) {
+                    Ok(history) => {
+                        let name = history.messages.last()
+                            .map(|message| message.display_name.as_str())
+                            .unwrap_or("Пустая переписка");
+                        let title = format!("{name} · {}", &room.to_string()[..8]);
+                        histories.push((room, title, history));
+                    }
+                    Err(error) => self.error = format!("Переписка {} недоступна. {error}", &room.to_string()[..8]),
                 }
             }
-            Ok(histories)
-        })();
+            histories.sort_by_key(|(_, _, history)| std::cmp::Reverse(
+                history.messages.last().map(|message| message.timestamp_ms).unwrap_or_default()
+            ));
+            histories
+        });
         match result {
             Ok(histories) => self.archives = Some(histories),
             Err(e) => {
@@ -1306,8 +1372,26 @@ impl App {
         }
         ui::section(ui, "ТЕКСТОВЫЕ КАНАЛЫ", light);
         for ch in CHANNELS {
-            if ui::nav_row(ui, light, ui::Icon::Hash, ch, self.channel == ch, None).clicked() {
-                self.channel = ch.into();
+            let count = self.unread_channels.get(ch).copied().unwrap_or_default();
+            let label = match count {
+                0 => ch.into(),
+                1..=99 => format!("{ch}   ·   {count}"),
+                _ => format!("{ch}   ·   99+"),
+            };
+            if ui::nav_row(ui, light, ui::Icon::Hash, &label, self.channel == ch,
+                (count > 0).then(|| ui::accent(light))).clicked()
+            {
+                self.unread_channels.remove(ch);
+                if self.channel != ch {
+                    if self.editing_message.take().is_some() {
+                        self.draft = self.draft_before_edit.take().unwrap_or_default();
+                    }
+                    self.channel_drafts.insert(self.channel.clone(), std::mem::take(&mut self.draft));
+                    self.reply_message = None;
+                    self.draft = self.channel_drafts.remove(ch).unwrap_or_default();
+                    self.channel = ch.into();
+                    self.chat_search.clear();
+                }
             }
         }
         ui.add_space(14.0);
@@ -2389,249 +2473,143 @@ impl App {
             return;
         }
         let light = self.profile.light_theme;
-        let mut open = true;
         let mut start = false;
         let mut cancel = false;
-        let mut refresh = false;
-        egui::Window::new("Поделиться экраном")
-            .id(egui::Id::new("share-picker"))
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
+        let modal = egui::Modal::new(egui::Id::new("share-picker"))
+            .frame(Frame::popup(&ctx.style()).fill(ui::sidebar(light)).corner_radius(18).inner_margin(20))
             .show(ctx, |ui| {
-                ui.set_width(460.0);
-                ui.label(
-                    RichText::new("Что показывать?")
-                        .size(16.0)
-                        .strong()
-                        .color(ui::text(light)),
-                );
-                ui.label(
-                    RichText::new(
-                        "Выберите весь экран или отдельное окно. Демонстрацию увидят все участники сервера, звук не передаётся.",
-                    )
-                    .size(12.5)
-                    .color(ui::muted(light)),
-                );
-                ui.add_space(8.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("share-sources")
-                    .max_height(300.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        for (index, source) in self.share_sources.iter().enumerate() {
-                            let text = format!("{}\n{}", source.title, source.detail);
-                            let response = ui.selectable_value(
-                                &mut self.share_source,
-                                index,
-                                RichText::new(text).size(13.0),
-                            );
-                            if response.double_clicked() {
-                                self.share_source = index;
-                                start = true;
-                            }
-                        }
-                    });
-                ui.add_space(4.0);
+                ui.set_width(580.0);
                 ui.horizontal(|ui| {
-                    if ui.add(ui::primary("Начать трансляцию")).clicked() {
-                        start = true;
-                    }
-                    if ui.add(ui::secondary("Отмена")).clicked() {
-                        cancel = true;
+                    ui.label(ui::heading("Поделиться экраном", 24.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        cancel = ui::icon_btn(ui, light, ui::Icon::Close, ui::Tone::Normal, false)
+                            .on_hover_text("Закрыть").clicked();
+                    });
+                });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let previous = self.share_windows_tab;
+                    ui.selectable_value(&mut self.share_windows_tab, false, "Мониторы");
+                    ui.selectable_value(&mut self.share_windows_tab, true, "Окна");
+                    if previous != self.share_windows_tab {
+                        self.share_source = share_ui::first_source(&self.share_sources, self.share_windows_tab);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(ui::secondary("Обновить список"))
-                            .on_hover_text("Перечитать открытые окна")
-                            .clicked()
-                        {
-                            refresh = true;
+                        if ui.button("Обновить").clicked() {
+                            let selected = self.share_sources.get(self.share_source).map(|item| item.source);
+                            self.share_sources = thodtalk::share::sources();
+                            self.share_source = self.share_sources.iter().position(|item| Some(item.source) == selected)
+                                .unwrap_or_else(|| share_ui::first_source(&self.share_sources, self.share_windows_tab));
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                if self.share_windows_tab {
+                    start |= share_ui::windows(ui, &self.share_sources, &mut self.share_source, light);
+                } else {
+                    share_ui::monitors(ui, &self.share_sources, &mut self.share_source, light);
+                }
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(7.0);
+                let selected = self.share_sources.get(self.share_source).filter(|item| {
+                    matches!(item.source, thodtalk::share::Source::Window(_)) == self.share_windows_tab
+                });
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let button = egui::Button::new(RichText::new("Начать демонстрацию").strong().color(egui::Color32::from_rgb(32, 19, 13)))
+                            .fill(share_ui::ORANGE).corner_radius(9).min_size(vec2(160.0, 34.0));
+                        start |= ui.add_enabled(selected.is_some(), button).clicked();
+                        if let Some(item) = selected {
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                ui.vertical(|ui| {
+                                    ui.add(egui::Label::new(RichText::new(&item.title).strong()).truncate());
+                                    ui.label(RichText::new(&item.detail).size(12.0).color(ui::muted(light)));
+                                });
+                            });
                         }
                     });
                 });
             });
-        if refresh {
-            self.share_sources = thodtalk::share::sources();
-            self.share_source = self
-                .share_source
-                .min(self.share_sources.len().saturating_sub(1));
-        }
         if start {
             self.start_share();
-        } else if cancel || !open {
+        } else if cancel || modal.should_close() {
             self.share_picker = false;
         }
     }
 
-    /// Always-on-top panel at the bottom of the shared monitor. It makes it
-    /// obvious that the screen is being broadcast and offers a stop button.
     fn share_hud(&mut self, ctx: &egui::Context) {
-        let Some(info) = self.share_info.clone() else {
-            return;
-        };
-        if self.share.is_none() {
-            self.share_info = None;
-            return;
+        let Some(info) = &self.share_info else { return; };
+        #[cfg(windows)]
+        if let Some(outline) = &mut self.share_outline {
+            outline.update();
         }
-        // Smoky glass: translucent dark fill, light hairline rim and a soft
-        // top highlight. The native viewport is transparent outside the pill.
-        let background = egui::Color32::from_rgba_unmultiplied(34, 34, 42, 150);
-        let border = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28);
-        let ((monitor_x, monitor_y, monitor_w, monitor_h), monitor_scale) =
+
+        let ((x, y, monitor_width, monitor_height), scale) =
             thodtalk::share::hud_geometry(info.source).unwrap_or(((0, 0, 1280, 720), 1.0));
-        let points_per_pixel = (monitor_scale * ctx.zoom_factor()).max(0.5);
-        let width = 252.0;
-        let height = 38.0;
-        let margin = 28.0;
-        let default_position = egui::pos2(
-            monitor_x as f32 / points_per_pixel + monitor_w as f32 / points_per_pixel / 2.0
-                - width / 2.0,
-            (monitor_y + monitor_h) as f32 / points_per_pixel - height - margin,
-        );
+        let scale = (scale * ctx.zoom_factor()).max(0.5);
+        let width = 176.0;
+        let height = 36.0;
         let mut builder = egui::ViewportBuilder::default()
             .with_title(SHARE_HUD_TITLE)
             .with_decorations(false)
             .with_resizable(false)
             .with_taskbar(false)
             .with_active(false)
-            .with_close_button(false)
             .with_always_on_top()
             .with_transparent(true)
             .with_inner_size([width, height]);
         if !self.share_hud_user_moved {
-            builder = builder.with_position(default_position);
+            builder = builder.with_position(pos2(
+                (x + monitor_width / 2) as f32 / scale - width / 2.0,
+                (y + monitor_height) as f32 / scale - height - 18.0,
+            ));
         }
         let mut stop = false;
-        let mut user_moved = self.share_hud_user_moved;
-        let title = info.title.clone();
-        let viewport_id = egui::ViewportId::from_hash_of((
-            "thodtalk-share-hud",
-            std::process::id(),
-            self.share_hud_seq,
-        ));
-        ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
-            if ctx.input(|input| input.viewport().close_requested()) {
-                stop = true;
-            }
+        let mut moved = self.share_hud_user_moved;
+        let viewport = egui::ViewportId::from_hash_of(("share-hud", self.share_hud_seq));
+        ctx.show_viewport_immediate(viewport, builder, |ctx, _| {
+            stop |= ctx.input(|i| i.viewport().close_requested());
             egui::CentralPanel::default()
-                .frame(
-                    egui::Frame::new()
-                        .fill(background)
-                        .stroke(egui::Stroke::new(1.0_f32, border))
-                        .corner_radius(19)
-                        .inner_margin(egui::Margin::symmetric(10, 6)),
-                )
+                .frame(Frame::NONE)
                 .show(ctx, |ui| {
-                    let rect = ui.max_rect();
-                    // One interaction for the whole pill: dragging anywhere
-                    // moves the window, clicking the phone icon stops sharing.
-                    let hit = ui.interact(
-                        rect,
-                        egui::Id::new("share-hud-hit"),
-                        Sense::click_and_drag(),
+                    use egui::{Color32, Stroke, StrokeKind};
+                    let rect = ui.max_rect().shrink(1.0);
+                    ui.painter().rect(
+                        rect, 17, Color32::from_rgba_unmultiplied(20, 23, 30, 204),
+                        Stroke::new(1.0_f32, Color32::from_white_alpha(40)), StrokeKind::Inside,
                     );
-                    let painter = ui.painter();
-                    let center_y = rect.center().y;
-                    let time = ctx.input(|input| input.time) as f32;
-                    let pulse = 0.55 + 0.45 * (time * 2.6).sin().abs();
-                    painter.circle_filled(
-                        egui::pos2(rect.left() + 3.5, center_y),
-                        3.5,
-                        egui::Color32::from_rgba_unmultiplied(
-                            236,
-                            138,
-                            58,
-                            (150.0 + 105.0 * pulse) as u8,
-                        ),
-                    );
-                    let button_center = egui::pos2(rect.right() - 13.0, center_y);
-                    let button_rect =
-                        egui::Rect::from_center_size(button_center, Vec2::splat(26.0));
-                    let over_button = hit
-                        .hover_pos()
-                        .is_some_and(|position| button_rect.contains(position));
-                    let button_fill = if over_button {
-                        egui::Color32::from_rgba_unmultiplied(150, 60, 40, 235)
-                    } else {
-                        egui::Color32::from_rgba_unmultiplied(98, 37, 28, 205)
-                    };
-                    painter.circle_filled(button_center, 13.0, button_fill);
-                    ui::paint_icon(
-                        painter,
-                        ui::Icon::HangUp,
-                        button_rect.shrink(7.0),
-                        egui::Color32::from_rgb(246, 234, 230),
-                        false,
-                    );
-                    painter.line_segment(
-                        [
-                            egui::pos2(rect.left() + 12.0, rect.top() + 0.5),
-                            egui::pos2(rect.right() - 12.0, rect.top() + 0.5),
-                        ],
-                        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(24)),
-                    );
-                    let text_left = rect.left() + 12.0;
-                    let text_right = button_center.x - 13.0 - 8.0;
-                    let max_width = (text_right - text_left).max(1.0);
-                    let mut text = egui::text::LayoutJob::default();
-                    text.wrap = egui::text::TextWrapping::truncate_at_width(max_width);
-                    text.append(
-                        "Идёт демонстрация",
-                        0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::proportional(11.0),
-                            color: egui::Color32::from_rgb(240, 238, 235),
-                            ..Default::default()
-                        },
-                    );
-                    text.append(
-                        &format!("  ·  {title}"),
-                        0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::proportional(10.5),
-                            color: egui::Color32::from_rgb(176, 172, 168),
-                            ..Default::default()
-                        },
-                    );
-                    let galley = ui.fonts(|fonts| fonts.layout_job(text));
-                    painter.galley(
-                        egui::pos2(text_left, center_y - galley.size().y / 2.0),
-                        galley,
-                        egui::Color32::WHITE,
-                    );
-                    if hit.clicked() {
-                        if let Some(position) = hit.interact_pointer_pos() {
-                            if button_rect.contains(position) {
-                                stop = true;
-                            }
+                    let stop_rect = Rect::from_center_size(pos2(rect.right() - 18.0, rect.center().y), vec2(26.0, 26.0));
+                    let drag_rect = Rect::from_min_max(rect.min, pos2(stop_rect.left() - 2.0, rect.bottom()));
+                    let drag = ui.interact(drag_rect, egui::Id::new("hud-grab"), Sense::drag())
+                        .on_hover_cursor(egui::CursorIcon::Grab)
+                        .on_hover_text(&info.title);
+                    if drag.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        moved = true;
+                    }
+                    if drag.dragged() { ctx.set_cursor_icon(egui::CursorIcon::Grabbing); }
+                    for ix in 0..2 {
+                        for iy in 0..3 {
+                            ui.painter().circle_filled(pos2(rect.left() + 11.0 + ix as f32 * 4.0, rect.center().y - 4.0 + iy as f32 * 4.0), 0.9, share_ui::MUTED);
                         }
                     }
-                    if hit.drag_started() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                        user_moved = true;
-                    }
-                    if over_button {
-                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-                    } else if hit.dragged() {
-                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                    } else if hit.hovered() {
-                        ctx.set_cursor_icon(egui::CursorIcon::Grab);
-                    }
+                    ui.painter().circle_filled(pos2(rect.left() + 29.0, rect.center().y), 3.0, share_ui::ORANGE);
+                    ui.painter().text(pos2(rect.left() + 40.0, rect.center().y), egui::Align2::LEFT_CENTER,
+                        "Идёт показ", egui::FontId::proportional(12.0), share_ui::TEXT);
+                    let button = ui.put(stop_rect, egui::Button::new("").fill(Color32::from_rgba_unmultiplied(171, 64, 53, 180)).corner_radius(8))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Остановить демонстрацию");
+                    ui.painter().rect_filled(stop_rect.shrink(8.5), 2, share_ui::TEXT);
+                    stop |= button.clicked();
                 });
         });
-        self.share_hud_user_moved = user_moved;
-        #[cfg(all(windows, not(debug_assertions)))]
+        self.share_hud_user_moved = moved;
+        #[cfg(windows)]
         thodtalk::share::exclude_from_capture(SHARE_HUD_TITLE);
-        if stop {
-            self.stop_share();
-        }
+        if stop { self.stop_share(); }
     }
 
     fn screen_window(&mut self, ctx: &egui::Context) {
-        let light = self.profile.light_theme;
         let Some((author, _)) = &self.screen_watch else {
             return;
         };
@@ -2670,20 +2648,32 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
                     self.screen_fullscreen = false;
                 }
-                egui::TopBottomPanel::bottom("screen-controls").show(ctx, |ui| {
+                egui::TopBottomPanel::top("screen-title")
+                    .frame(Frame::new().fill(share_ui::TOOLBAR).inner_margin(Margin::symmetric(16, 10)))
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            let (dot, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+                            ui.painter().circle_filled(dot.center(), 3.5, share_ui::ORANGE);
+                            ui.label(RichText::new(&name).size(15.0).strong().color(share_ui::TEXT));
+                            if let Some(texture) = &texture {
+                                let [width, height] = texture.size();
+                                ui.label(RichText::new(format!("{width} × {height}")).size(12.0).color(share_ui::MUTED));
+                            }
+                        });
+                    });
+                egui::TopBottomPanel::bottom("screen-controls")
+                    .frame(Frame::new().fill(share_ui::TOOLBAR).inner_margin(Margin::symmetric(12, 8)))
+                    .show(ctx, |ui| {
+                    share_ui::viewer_style(ui);
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("На весь экран").clicked() {
-                            self.screen_fullscreen = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
-                        }
-                        if ui.button("Отключиться").clicked() {
-                            hide = true;
+                        if ui.button(if self.screen_fullscreen { "Выйти из полного экрана" } else { "На весь экран" }).clicked() {
+                            self.screen_fullscreen = !self.screen_fullscreen;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.screen_fullscreen));
                         }
                         if supports_quality {
-                            ui.label("Качество");
                             let previous = self.screen_quality;
                             egui::ComboBox::from_id_salt("viewer-quality")
-                                .selected_text(self.screen_quality.map_or("Авто", Quality::label))
+                                .selected_text(format!("Качество · {}", self.screen_quality.map_or("Авто", Quality::label)))
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(&mut self.screen_quality, None, "Авто");
                                     for quality in Quality::ALL {
@@ -2699,18 +2689,15 @@ impl App {
                                 self.send_screen_feedback();
                             }
                         }
-                        if let Some(texture) = &texture {
-                            let [width, height] = texture.size();
-                            ui.label(
-                                RichText::new(format!("{width}×{height}")).color(ui::muted(light)),
-                            );
-                        }
                         if stalled {
-                            ui.label("Ожидаем новые кадры…");
+                            ui.label(RichText::new("Ожидаем новые кадры…").color(share_ui::MUTED));
                         }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            hide |= ui.add(egui::Button::new("Закрыть просмотр").fill(egui::Color32::from_rgb(62, 34, 40)).corner_radius(8)).clicked();
+                        });
                     });
                 });
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().frame(Frame::new().fill(share_ui::STAGE)).show(ctx, |ui| {
                     ui.centered_and_justified(|ui| {
                         if let Some(texture) = &texture {
                             let source = texture.size_vec2();
@@ -2718,7 +2705,10 @@ impl App {
                             let scale = (max.x / source.x).min(max.y / source.y).max(0.01);
                             ui.add(egui::Image::new((texture.id(), source * scale)));
                         } else {
-                            ui.label("Ожидаем изображение…");
+                            ui.vertical_centered(|ui| {
+                                ui.add(egui::Spinner::new().size(24.0).color(share_ui::ORANGE));
+                                ui.label(RichText::new("Ожидаем изображение…").color(share_ui::MUTED));
+                            });
                         }
                     });
                 });
@@ -2755,6 +2745,9 @@ impl App {
         let mut toggle_members = false;
         let mut toggle_closed = false;
         let mut copy = false;
+        let mut search = ctx.input_mut(|input| {
+            input.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::F))
+        });
         egui::TopBottomPanel::top("chat_bar")
             .exact_height(48.0)
             .frame(
@@ -2766,6 +2759,7 @@ impl App {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        search |= ui.add(ui::secondary("Поиск")).on_hover_text("Поиск в канале · Ctrl+F").clicked();
                         if ui::icon_btn(
                             ui,
                             light,
@@ -2853,6 +2847,29 @@ impl App {
                     });
                 });
             });
+        if search {
+            self.chat_search_visible = true;
+        }
+        if self.chat_search_visible {
+            egui::TopBottomPanel::top("chat-search")
+                .frame(Frame::new().fill(ui::bg(light)).inner_margin(Margin::symmetric(16, 6)))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let input = ui.add(egui::TextEdit::singleline(&mut self.chat_search)
+                            .desired_width((ui.available_width() - 48.0).max(80.0))
+                            .hint_text(ui::hint("Искать в канале", light)));
+                        if search { input.request_focus(); }
+                        let escape = input.has_focus()
+                            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+                        if escape || ui::icon_btn(ui, light, ui::Icon::Close, ui::Tone::Normal, false)
+                            .on_hover_text("Закрыть поиск").clicked()
+                        {
+                            self.chat_search_visible = false;
+                            self.chat_search.clear();
+                        }
+                    });
+                });
+        }
         if toggle_members {
             self.show_members = !self.show_members;
         }
@@ -2894,8 +2911,9 @@ impl App {
                         && m.image.is_none()
                         && m.file.is_none()
                 }) {
-                    self.draft = m.text.clone();
+                    self.draft_before_edit = Some(std::mem::replace(&mut self.draft, m.text.clone()));
                     self.editing_message = Some(m.id);
+                    self.reply_message = None;
                     self.focus_composer = true;
                 }
             }
@@ -2906,7 +2924,7 @@ impl App {
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if cancel_edit {
             self.editing_message = None;
-            self.draft.clear();
+            self.draft = self.draft_before_edit.take().unwrap_or_default();
         }
         // Если сообщение исчезло (удалено или сменился канал) — сбрасываем режим правки.
         if let Some(id) = self.editing_message {
@@ -2918,7 +2936,7 @@ impl App {
             });
             if !still_there {
                 self.editing_message = None;
-                self.draft.clear();
+                self.draft = self.draft_before_edit.take().unwrap_or_default();
             }
         }
         let hint = match self.editing_message {
@@ -2936,6 +2954,20 @@ impl App {
             }))
             .show_separator_line(false)
             .show(ctx, |ui| {
+                if let Some(id) = self.reply_message {
+                    let target = self.session.as_ref().and_then(|s| s.history.messages.iter().find(|m| m.id == id));
+                    ui.horizontal(|ui| {
+                        let caption = target.map(|m| format!("Ответ для {} · {}", m.display_name, message_excerpt(m)))
+                            .unwrap_or_else(|| "Ответ на сообщение".into());
+                        ui.add(egui::Label::new(RichText::new(caption).color(ui::accent(light))).truncate());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui::icon_btn(ui, light, ui::Icon::Close, ui::Tone::Normal, false)
+                                .on_hover_text("Отменить ответ").clicked() {
+                                self.reply_message = None;
+                            }
+                        });
+                    });
+                }
                 Frame::new()
                     .fill(ui::input(light))
                     .corner_radius(10)
@@ -2949,7 +2981,7 @@ impl App {
                                 light,
                                 ui::Icon::Plus,
                                 ui::Tone::Normal,
-                                ready,
+                                ready && self.editing_message.is_none(),
                             )
                             .on_hover_text("Прикрепить файл")
                             .clicked();
@@ -3000,13 +3032,16 @@ impl App {
             let session = self.session.as_mut().unwrap();
             let result = match self.editing_message {
                 Some(id) => session.edit_chat(id, &self.draft),
-                None => session.chat(&self.channel, &self.draft),
+                None => session.chat(&self.channel, &self.draft, self.reply_message),
             };
             match result {
                 Ok(()) => {
                     let edited = self.editing_message.take().is_some();
-                    self.draft.clear();
-                    if !edited {
+                    if edited {
+                        self.draft = self.draft_before_edit.take().unwrap_or_default();
+                    } else {
+                        self.draft.clear();
+                        self.reply_message = None;
                         self.sound(thodtalk::sounds::Sound::Sent);
                     }
                     ctx.memory_mut(|m| m.request_focus(composer_id));
@@ -3020,13 +3055,13 @@ impl App {
         let light = self.profile.light_theme;
         let channel = self.channel.clone();
         let session = self.session.as_ref().unwrap();
-        // 0 — редактировать, 1 — удалить у себя, 2 — удалить у всех.
-        let mut action: Option<(uuid::Uuid, u8)> = None;
+        let mut action = None;
         let mut save_existing: Option<(uuid::Uuid, String)> = None;
         let mut open_existing: Option<(uuid::Uuid, String, u64)> = None;
+        let query = self.chat_search.trim().to_lowercase();
         egui::ScrollArea::vertical()
-            .id_salt(("messages", &channel))
-            .stick_to_bottom(true)
+            .id_salt(("messages", &channel, query.is_empty()))
+            .stick_to_bottom(query.is_empty())
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 Frame::new()
@@ -3037,11 +3072,11 @@ impl App {
                             .history
                             .messages
                             .iter()
-                            .filter(|m| m.channel == channel)
+                            .filter(|m| m.channel == channel && message_matches(m, &query))
                             .collect();
                         let start = messages.len().saturating_sub(300);
                         let shown = &messages[start..];
-                        if start == 0 {
+                        if shown.is_empty() {
                             ui.add_space(12.0);
                             let (rect, _) = ui.allocate_exact_size(Vec2::splat(68.0), Sense::hover());
                             ui.painter()
@@ -3054,17 +3089,26 @@ impl App {
                                 false,
                             );
                             ui.add_space(10.0);
-                            ui.label(ui::heading(format!("Добро пожаловать в #{channel}!"), 26.0));
-                            ui.label(
-                                RichText::new(format!(
-                                    "Это начало канала #{channel}. Сообщения останутся только у вас и участников."
-                                ))
-                                .color(ui::muted(light)),
-                            );
+                            ui.label(ui::heading(if query.is_empty() {
+                                format!("В #{channel} пока нет сообщений")
+                            } else { "Совпадений нет".into() }, 21.0));
                             ui.add_space(8.0);
                         }
+                        let mut previous_date = String::new();
                         for (i, m) in shown.iter().enumerate() {
-                            let first = i == 0 || {
+                            let (date, time) = chat_time(m.timestamp_ms);
+                            let new_day = !date.is_empty() && date != previous_date;
+                            if new_day {
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&date).size(11.5).color(ui::muted(light)));
+                                    let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 8.0), Sense::hover());
+                                    ui.painter().line_segment([line.left_center(), line.right_center()],
+                                        egui::Stroke::new(1.0_f32, ui::line(light)));
+                                });
+                                previous_date = date;
+                            }
+                            let first = i == 0 || new_day || m.reply_to.is_some() || {
                                 let p = shown[i - 1];
                                 p.author_key != m.author_key
                                     || m.timestamp_ms.abs_diff(p.timestamp_ms) > 300_000
@@ -3101,17 +3145,11 @@ impl App {
                                                 "Ключ профиля: {}",
                                                 key_string(&m.author_key)
                                             ));
-                                            let seconds = m.timestamp_ms / 1000;
                                             ui.label(
-                                                RichText::new(format!(
-                                                    "{:02}:{:02}",
-                                                    seconds / 3600 % 24,
-                                                    seconds / 60 % 60
-                                                ))
+                                                RichText::new(&time)
                                                 .size(11.5)
                                                 .color(ui::muted(light)),
-                                            )
-                                            .on_hover_text("Время по UTC");
+                                            );
                                             if m.edited {
                                                 ui.label(
                                                     RichText::new("изменено")
@@ -3121,6 +3159,12 @@ impl App {
                                                 );
                                             }
                                         });
+                                    }
+                                    if let Some(reply) = m.reply_to {
+                                        let target = session.history.messages.iter().find(|target| target.id == reply && target.channel == channel);
+                                        let caption = target.map(|target| format!("↳ {} · {}", target.display_name, message_excerpt(target)))
+                                            .unwrap_or_else(|| "↳ Исходное сообщение недоступно".into());
+                                        ui.add(egui::Label::new(RichText::new(caption).size(12.0).color(ui::muted(light))).truncate());
                                     }
                                     if let Some(id) = m.image {
                                         if let Some(response) = show_image(
@@ -3135,6 +3179,10 @@ impl App {
                                             let own = m.author_key == session.own_key();
                                             let can_delete_all = own || session.hosting();
                                             response.context_menu(|ui| {
+                                                if ui.button("Ответить").clicked() {
+                                                    action = Some((m.id, MessageAction::Reply));
+                                                    ui.close_menu();
+                                                }
                                                 if ui.button("Сохранить на компьютер").clicked() {
                                                     if let Err(e) =
                                                         save_attachment(&self.store, id)
@@ -3145,13 +3193,13 @@ impl App {
                                                 }
                                                 ui.separator();
                                                 if ui.button("Удалить у себя").clicked() {
-                                                    action = Some((m.id, 1));
+                                                    action = Some((m.id, MessageAction::DeleteLocal));
                                                     ui.close_menu();
                                                 }
                                                 if can_delete_all
                                                     && ui.button("Удалить у всех").clicked()
                                                 {
-                                                    action = Some((m.id, 2));
+                                                    action = Some((m.id, MessageAction::DeleteForEveryone));
                                                     ui.close_menu();
                                                 }
                                             });
@@ -3243,6 +3291,10 @@ impl App {
                                                 Some((m.id, file.name.clone(), file.size));
                                         }
                                         response.context_menu(|ui| {
+                                            if ui.button("Ответить").clicked() {
+                                                action = Some((m.id, MessageAction::Reply));
+                                                ui.close_menu();
+                                            }
                                             if ui.button("Сохранить на компьютер").clicked() {
                                                 save_existing =
                                                     Some((m.id, file.name.clone()));
@@ -3250,13 +3302,13 @@ impl App {
                                             }
                                             ui.separator();
                                             if ui.button("Удалить у себя").clicked() {
-                                                action = Some((m.id, 1));
+                                                action = Some((m.id, MessageAction::DeleteLocal));
                                                 ui.close_menu();
                                             }
                                             if can_delete_all
                                                 && ui.button("Удалить у всех").clicked()
                                             {
-                                                action = Some((m.id, 2));
+                                                action = Some((m.id, MessageAction::DeleteForEveryone));
                                                 ui.close_menu();
                                             }
                                         });
@@ -3278,22 +3330,26 @@ impl App {
                                         let own = m.author_key == session.own_key();
                                         let can_delete_all = own || session.hosting();
                                         response.context_menu(|ui| {
+                                            if ui.button("Ответить").clicked() {
+                                                action = Some((m.id, MessageAction::Reply));
+                                                ui.close_menu();
+                                            }
                                             if ui.button("Копировать").clicked() {
                                                 ui.ctx().copy_text(selected.clone().unwrap_or_else(|| m.text.clone()));
                                                 ui.close_menu();
                                             }
                                             if own && ui.button("Редактировать").clicked() {
-                                                action = Some((m.id, 0));
+                                                action = Some((m.id, MessageAction::Edit));
                                                 ui.close_menu();
                                             }
                                             if ui.button("Удалить у себя").clicked() {
-                                                action = Some((m.id, 1));
+                                                action = Some((m.id, MessageAction::DeleteLocal));
                                                 ui.close_menu();
                                             }
                                             if can_delete_all
                                                 && ui.button("Удалить у всех").clicked()
                                             {
-                                                action = Some((m.id, 2));
+                                                action = Some((m.id, MessageAction::DeleteForEveryone));
                                                 ui.close_menu();
                                             }
                                         });
@@ -3318,28 +3374,30 @@ impl App {
         if let Some((id, name, size)) = open_existing {
             self.file_preview = Some((id, name, size));
         }
-        if let Some((id, kind)) = action {
-            match kind {
-                0 => {
-                    if let Some(session) = &self.session {
-                        if let Some(m) = session.history.messages.iter().find(|m| m.id == id) {
-                            self.draft = m.text.clone();
-                            self.editing_message = Some(id);
-                            self.focus_composer = true;
+        if let Some((id, action)) = action {
+            match action {
+                MessageAction::Edit => {
+                    if let Some(message) = self.session.as_ref().and_then(|session| session.history.messages.iter().find(|m| m.id == id)) {
+                        if self.editing_message.is_none() {
+                            self.draft_before_edit = Some(std::mem::take(&mut self.draft));
                         }
+                        self.draft = message.text.clone();
+                        self.editing_message = Some(id);
+                        self.reply_message = None;
+                        self.focus_composer = true;
                     }
                 }
-                1 => {
-                    if let Some(session) = &mut self.session {
-                        if let Err(e) = session.delete_chat(id, false) {
-                            self.error = e.to_string();
-                        }
+                MessageAction::Reply => {
+                    if self.editing_message.take().is_some() {
+                        self.draft = self.draft_before_edit.take().unwrap_or_default();
                     }
+                    self.reply_message = Some(id);
+                    self.focus_composer = true;
                 }
-                _ => {
+                MessageAction::DeleteLocal | MessageAction::DeleteForEveryone => {
                     if let Some(session) = &mut self.session {
-                        if let Err(e) = session.delete_chat(id, true) {
-                            self.error = e.to_string();
+                        if let Err(error) = session.delete_chat(id, matches!(action, MessageAction::DeleteForEveryone)) {
+                            self.error = error.to_string();
                         }
                     }
                 }
@@ -3465,118 +3523,121 @@ impl App {
 
     fn archive_ui(&mut self, ui: &mut egui::Ui) {
         let light = self.profile.light_theme;
-        if self.archives.is_none() {
-            self.load_archives();
-        }
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                Frame::new()
-                    .inner_margin(Margin::symmetric(32, 28))
-                    .show(ui, |ui| {
-                        ui.set_max_width(720.0);
-                        ui.label(ui::heading("Сохранённые переписки", 24.0));
-                        ui.label(
-                            RichText::new(
-                                "Доступны без подключения. Показаны последние 300 сообщений.",
-                            )
-                            .color(ui::muted(light)),
-                        );
-                        ui.add_space(16.0);
-                        match &self.archives {
-                            None => {}
-                            Some(histories) if histories.is_empty() => {
-                                ui.add_space(40.0);
-                                ui.vertical_centered(|ui| {
-                                    let (rect, _) =
-                                        ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
-                                    ui::paint_icon(
-                                        ui.painter(),
-                                        ui::Icon::Archive,
-                                        rect,
-                                        ui::muted(light),
-                                        false,
-                                    );
-                                    ui.add_space(8.0);
-                                    ui.label(ui::heading("Пока ничего нет", 18.0));
-                                    ui.label(
-                                        RichText::new(
-                                            "Здесь появятся переписки после первого разговора.",
-                                        )
-                                        .color(ui::muted(light)),
-                                    );
-                                });
-                            }
-                            Some(histories) => {
-                                for (name, history) in histories {
-                                    ui::card(ui, light, |ui| {
-                                        ui.collapsing(RichText::new(name).size(15.0), |ui| {
-                                            ui.add_space(6.0);
-                                            for m in history
-                                                .messages
-                                                .iter()
-                                                .rev()
-                                                .take(300)
-                                                .collect::<Vec<_>>()
-                                                .into_iter()
-                                                .rev()
-                                            {
-                                                ui.horizontal(|ui| {
-                                                    ui.spacing_mut().item_spacing.x = 8.0;
-                                                    ui.label(
-                                                        ui::heading(&m.display_name, 14.0).color(
-                                                            ui::name_color(&m.display_name, light),
-                                                        ),
-                                                    );
-                                                    ui.label(
-                                                        RichText::new(format!("#{}", m.channel))
-                                                            .size(12.0)
-                                                            .color(ui::muted(light)),
-                                                    );
-                                                });
-                                                if let Some(id) = m.image {
-                                                    if let Some(response) = show_image(
-                                                        ui,
-                                                        &self.store,
-                                                        &mut self.image_textures,
-                                                        id,
-                                                    ) {
-                                                        if response.clicked() {
-                                                            self.preview_image = Some(id);
-                                                        }
-                                                        response.context_menu(|ui| {
-                                                            if ui
-                                                                .button("Сохранить на компьютер")
-                                                                .clicked()
-                                                            {
-                                                                if let Err(e) =
-                                                                    save_attachment(&self.store, id)
-                                                                {
-                                                                    self.error = e.to_string();
-                                                                }
-                                                                ui.close_menu();
-                                                            }
-                                                        });
-                                                    } else {
-                                                        ui.label(
-                                                            RichText::new("Изображение недоступно")
-                                                                .size(14.0)
-                                                                .color(ui::muted(light)),
-                                                        );
-                                                    }
-                                                } else {
-                                                    ui.label(&m.text);
-                                                }
-                                                ui.add_space(6.0);
-                                            }
-                                        });
-                                    });
-                                    ui.add_space(8.0);
-                                }
-                            }
+        if self.archives.is_none() { self.load_archives(); }
+        let ready = self.connecting.is_none() && self.session.is_none();
+        let mut clear = self.archive_clear;
+        let mut file = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            Frame::new().inner_margin(Margin::symmetric(28, 24)).show(ui, |ui| {
+                ui.set_max_width(760.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(ui::heading("Сохранённые переписки", 24.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add_enabled(ready && self.archive_count > 0, ui::secondary("Очистить всё")).clicked() {
+                            clear = Some(ArchiveClear::All);
                         }
                     });
+                });
+                ui.add_space(10.0);
+                ui.add(egui::TextEdit::singleline(&mut self.archive_search)
+                    .desired_width(f32::INFINITY).hint_text(ui::hint("Поиск по сообщениям, именам и файлам", light)));
+                ui.add_space(12.0);
+                let query = self.archive_search.trim().to_lowercase();
+                let mut shown = false;
+                if let Some(histories) = &self.archives {
+                    for (room, title, history) in histories {
+                        let matches: Vec<_> = history.messages.iter().rev()
+                            .filter(|message| message_matches(message, &query))
+                            .take(300).collect();
+                        if !query.is_empty() && matches.is_empty() { continue; }
+                        shown = true;
+                        ui.push_id(room, |ui| {
+                            ui::card(ui, light, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(ui::heading(title, 15.0));
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.add_enabled(ready, ui::secondary("Очистить")).clicked() {
+                                            clear = Some(ArchiveClear::Room(*room));
+                                        }
+                                    });
+                                });
+                                let caption = if query.is_empty() { messages_count(history.messages.len()) }
+                                    else if matches.len() == 300 { "300 совпадений и более".into() }
+                                    else { format!("Найдено: {}", matches.len()) };
+                                egui::CollapsingHeader::new(caption).id_salt(room).default_open(!query.is_empty())
+                                    .show(ui, |ui| {
+                                        for message in matches.iter().rev() {
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.label(ui::heading(&message.display_name, 14.0).color(ui::name_color(&message.display_name, light)));
+                                                ui.label(RichText::new(format!("#{} · {}", message.channel, chat_time(message.timestamp_ms).1))
+                                                    .size(11.0).color(ui::muted(light)));
+                                            });
+                                            if let Some(attachment) = &message.file {
+                                                if ui.button(format!("{} · {}", attachment.name, file_size(attachment.size))).clicked() {
+                                                    file = Some((message.id, attachment.name.clone(), attachment.size));
+                                                }
+                                            } else if let Some(id) = message.image {
+                                                if let Some(response) = show_image(ui, &self.store, &mut self.image_textures, id) {
+                                                    if response.clicked() { self.preview_image = Some(id); }
+                                                    response.context_menu(|ui| {
+                                                        if ui.button("Сохранить на компьютер").clicked() {
+                                                            if let Err(error) = save_attachment(&self.store, id) { self.error = error.to_string(); }
+                                                            ui.close_menu();
+                                                        }
+                                                    });
+                                                } else {
+                                                    ui.label("Изображение недоступно");
+                                                }
+                                            } else {
+                                                ui.label(&message.text);
+                                            }
+                                            ui.add_space(8.0);
+                                        }
+                                    });
+                            });
+                        });
+                        ui.add_space(8.0);
+                    }
+                }
+                if !shown {
+                    ui.add_space(30.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(ui::heading(if query.is_empty() { "Сохранённых переписок пока нет" } else { "Совпадений нет" }, 18.0));
+                    });
+                }
             });
+        });
+        if let Some(file) = file { self.file_preview = Some(file); }
+        self.archive_clear = clear;
+        if let Some(scope) = self.archive_clear {
+            let result = egui::Modal::new(egui::Id::new("archive-clear")).show(ui.ctx(), |ui| {
+                ui.set_width(355.0);
+                let all = matches!(scope, ArchiveClear::All);
+                ui.label(ui::heading(if all { "Очистить все переписки?" } else { "Очистить переписку?" }, 19.0));
+                ui.label("История и её вложения будут удалены с этого компьютера.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let cancel = ui.button("Отмена").clicked();
+                    let confirm = ui.add_enabled(ready, egui::Button::new("Очистить")
+                        .fill(ui::danger_bg(light))).clicked();
+                    (cancel, confirm)
+                }).inner
+            });
+            if result.inner.1 {
+                let room = match scope { ArchiveClear::Room(room) => Some(room), ArchiveClear::All => None };
+                self.error.clear();
+                if let Err(error) = thodtalk::history::History::clear_saved(&self.store, room) {
+                    self.error = format!("Не удалось полностью очистить историю. {error}");
+                }
+                self.archive_clear = None;
+                self.preview_image = None;
+                self.file_preview = None;
+                self.image_textures.clear();
+                self.load_archives();
+            } else if result.inner.0 || result.should_close() {
+                self.archive_clear = None;
+            }
+        }
     }
 
     // ───────────────────────── Настройки ─────────────────────────
@@ -4018,6 +4079,10 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         thodtalk::diagnostics::enable(self.profile.debug_terminal, self.store.root.clone());
         thodtalk::diagnostics::window(ctx, &mut self.profile.debug_terminal);
@@ -4082,6 +4147,48 @@ fn messages_count(count: usize) -> String {
         "сообщений"
     };
     format!("{count} {word}")
+}
+
+fn message_matches(message: &thodtalk::history::Message, query: &str) -> bool {
+    query.is_empty()
+        || message.text.to_lowercase().contains(query)
+        || message.display_name.to_lowercase().contains(query)
+        || message.channel.to_lowercase().contains(query)
+        || message.file.as_ref().is_some_and(|file| file.name.to_lowercase().contains(query))
+}
+
+fn message_excerpt(message: &thodtalk::history::Message) -> String {
+    let text = message.file.as_ref().map_or(message.text.as_str(), |file| &file.name);
+    let mut chars = text.trim().chars().map(|ch| if ch.is_whitespace() { ' ' } else { ch });
+    let mut excerpt: String = chars.by_ref().take(90).collect();
+    if chars.next().is_some() { excerpt.push('…'); }
+    excerpt
+}
+
+fn chat_time(timestamp_ms: u64) -> (String, String) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{
+            Foundation::{FILETIME, SYSTEMTIME},
+            System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTimeEx},
+        };
+        let ticks = timestamp_ms.saturating_add(11_644_473_600_000).saturating_mul(10_000);
+        let time = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+        unsafe {
+            let mut utc: SYSTEMTIME = std::mem::zeroed();
+            let mut local: SYSTEMTIME = std::mem::zeroed();
+            if FileTimeToSystemTime(&time, &mut utc) != 0
+                && SystemTimeToTzSpecificLocalTimeEx(std::ptr::null(), &utc, &mut local) != 0
+            {
+                return (
+                    format!("{:02}.{:02}.{}", local.wDay, local.wMonth, local.wYear),
+                    format!("{:02}:{:02}", local.wHour, local.wMinute),
+                );
+            }
+        }
+    }
+    let minutes = timestamp_ms / 60_000;
+    (String::new(), format!("{:02}:{:02} UTC", minutes / 60 % 24, minutes % 60))
 }
 impl App {
     fn check_updates(&mut self) {
@@ -4281,19 +4388,22 @@ fn open_file(store: &Store, id: uuid::Uuid, name: &str) -> anyhow::Result<()> {
     std::fs::write(&path, &bytes)?;
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
         // Mark the extracted copy as downloaded so Windows can warn about
         // executable content before it runs.
         let _ = std::fs::write(
             format!("{}:Zone.Identifier", path.display()),
             "[ZoneTransfer]\r\nZoneId=3\r\n",
         );
-        let target = path.to_string_lossy().into_owned();
-        std::process::Command::new("cmd")
-            .args(["/C", "start", ""])
-            .arg(target)
-            .creation_flags(0x0800_0000)
-            .spawn()?;
+        let target: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(), std::ptr::null(), target.as_ptr(),
+                std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL,
+            )
+        } as isize;
+        anyhow::ensure!(result > 32, "Windows не удалось открыть файл (код {result})");
     }
     #[cfg(not(windows))]
     {

@@ -111,7 +111,7 @@ impl Relay {
                     // Guests send a session probe every three seconds. Do not
                     // leave a dead membership around for QUIC's PTO-dependent
                     // transport timeout after a process/computer disappears.
-                    if (peer.admitted && peer.last_activity.elapsed() > Duration::from_secs(20))
+                    if (peer.admitted && peer.last_activity.elapsed() > Duration::from_secs(15))
                         || (!peer.admitted && peer.since.elapsed() > Duration::from_secs(60))
                     {
                         departed.push(id);

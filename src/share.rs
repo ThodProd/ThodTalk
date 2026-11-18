@@ -176,25 +176,13 @@ pub fn sources() -> Vec<SourceInfo> {
             Some(collect_monitor),
             &mut monitors as *mut _ as LPARAM,
         );
-        monitors.sort_by_key(|monitor| (monitor.1, monitor.2));
-        if monitors.len() > 1 {
-            for (index, (primary, x, y, width, height, name)) in monitors.into_iter().enumerate() {
-                let title = if primary {
-                    format!("Монитор {} (основной)", index + 1)
-                } else {
-                    format!("Монитор {}", index + 1)
-                };
-                result.push(SourceInfo {
-                    title,
-                    detail: format!("{width}×{height} · {name}"),
-                    source: Source::Monitor {
-                        x,
-                        y,
-                        width,
-                        height,
-                    },
-                });
-            }
+        monitors.sort_by_key(|monitor| (!monitor.0, monitor.1, monitor.2));
+        for (index, (primary, x, y, width, height, _)) in monitors.into_iter().enumerate() {
+            result.push(SourceInfo {
+                title: format!("Монитор {}", index + 1),
+                detail: if primary { format!("{width}×{height} · Основной") } else { format!("{width}×{height}") },
+                source: Source::Monitor { x, y, width, height },
+            });
         }
         let mut windows: Vec<(String, isize, i32, i32)> = Vec::new();
         EnumWindows(Some(collect), &mut windows as *mut _ as LPARAM);

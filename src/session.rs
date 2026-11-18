@@ -42,6 +42,8 @@ pub enum Payload {
         text: String,
         time: u64,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<uuid::Uuid>,
     },
     ChatEdit {
         id: uuid::Uuid,
@@ -505,6 +507,7 @@ impl Session {
                 timestamp_ms: time,
                 image: Some(id),
                 edited: false,
+                reply_to: None,
                 file: None,
             },
         )?;
@@ -573,6 +576,7 @@ impl Session {
                     size,
                 }),
                 edited: false,
+                reply_to: None,
             },
         )?;
         self.file_queue.push_back(PendingFile {
@@ -626,6 +630,13 @@ impl Session {
         }
     }
     pub fn chat(&mut self, channel: &str, text: &str) -> Result<()> {
+        self.chat_with_reply(channel, text, None)
+    }
+
+    pub fn chat_with_reply(
+        &mut self, channel: &str, text: &str, reply_to: Option<uuid::Uuid>,
+    ) -> Result<()> {
+        ensure!(valid_channel(channel), "Неизвестный канал");
         ensure!(
             text.len() <= 16 * 1024 && !text.trim().is_empty(),
             "Сообщение пустое или слишком большое"
@@ -638,6 +649,7 @@ impl Session {
             text: text.into(),
             time,
             name: self.profile.name.clone(),
+            reply_to,
         })?;
         self.history.append(
             &self.store,
@@ -650,6 +662,7 @@ impl Session {
                 image: None,
                 channel: channel.into(),
                 edited: false,
+                reply_to,
                 file: None,
             },
         )?;
@@ -900,6 +913,7 @@ impl Session {
                                     timestamp_ms: time,
                                     image: Some(id),
                                     edited: false,
+                                    reply_to: None,
                                     file: None,
                                 },
                             )?;
@@ -933,16 +947,18 @@ impl Session {
                             text,
                             time,
                             name,
+                            reply_to,
                         } => {
                             if !valid_channel(&channel)
                                 || text.trim().is_empty()
                                 || text.len() > 16 * 1024
+                                || text.trim().is_empty()
                                 || name.chars().count() > 40
                                 || name.chars().any(char::is_control)
                             {
                                 continue;
                             }
-                            self.history.append(
+                            if let Err(error) = self.history.append(
                                 &self.store,
                                 Message {
                                     id,
@@ -953,9 +969,12 @@ impl Session {
                                     image: None,
                                     channel,
                                     edited: false,
+                                    reply_to: reply_to.filter(|target| *target != id),
                                     file: None,
                                 },
-                            )?;
+                            ) {
+                                crate::diagnostics::report("История сообщений", Some(false), error.to_string());
+                            }
                         }
                         Payload::ChatEdit { id, text } => {
                             if text.len() > 16 * 1024 || text.trim().is_empty() {
@@ -1167,6 +1186,7 @@ impl Session {
                                         size: file.size as u64,
                                     }),
                                     edited: false,
+                                    reply_to: None,
                                 },
                             );
                         }

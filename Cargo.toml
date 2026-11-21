@@ -1,6 +1,6 @@
 [package]
 name = "thodtalk"
-version = "0.3.15"
+version = "0.3.16"
 edition = "2024"
 
 [dependencies]
@@ -32,7 +32,7 @@ zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
-windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_System_LibraryLoader", "Win32_System_Time", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_Security", "Win32_Security_Cryptography", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Time", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 tray-icon = "0.26.1"
 
 [profile.release]

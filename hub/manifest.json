@@ -1,1 +1,1 @@
-{"schemaVersion":1,"hubApi":1,"id":"thodtalk","version":"0.3.15","platform":"win-x64","mode":"standalone","launch":{"executable":"app/thodtalk.exe","arguments":[]},"permissions":[]}
+{"schemaVersion":1,"hubApi":1,"id":"thodtalk","version":"0.3.16","platform":"win-x64","mode":"standalone","primaryLanguage":"Rust","launch":{"executable":"app/thodtalk.exe","arguments":[]},"actions":[{"id":"settings","label":"Настройки","arguments":["--settings"]}],"permissions":[]}

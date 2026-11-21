@@ -15,6 +15,7 @@ use std::{
 struct TrayController {
     _icon: tray_icon::TrayIcon,
     show: Arc<AtomicBool>,
+    settings: Arc<AtomicBool>,
     quit: Arc<AtomicBool>,
     repaint: Arc<Mutex<Option<egui::Context>>>,
     hwnd: Arc<std::sync::atomic::AtomicIsize>,
@@ -68,7 +69,14 @@ impl TrayController {
             .with_tooltip("ThodTalk")
             .with_icon(icon)
             .build()?;
-        Ok(Self { _icon: icon, show, quit, repaint, hwnd })
+        Ok(Self {
+            _icon: icon,
+            show,
+            settings: Arc::new(AtomicBool::new(false)),
+            quit,
+            repaint,
+            hwnd,
+        })
     }
 
     fn restore_native(handle: isize) {
@@ -92,8 +100,50 @@ impl TrayController {
         if let Ok(mut repaint) = self.repaint.lock() { *repaint = Some(cc.egui_ctx.clone()); }
     }
 
-    fn poll(&self, ctx: &egui::Context, allow_close: &mut bool) {
-        if self.show.swap(false, Ordering::Relaxed) {
+    fn listen_for_settings(&self, event: std::os::windows::io::OwnedHandle) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::WaitForSingleObject,
+            UI::WindowsAndMessaging::{IsIconic, IsWindowVisible, SW_RESTORE, ShowWindowAsync},
+        };
+
+        let repaint = self.repaint.clone();
+        let settings = Arc::downgrade(&self.settings);
+        let hwnd = self.hwnd.clone();
+        std::thread::Builder::new()
+            .name("settings-activation".into())
+            .spawn(move || {
+                while settings.strong_count() != 0 {
+                    match unsafe { WaitForSingleObject(event.as_raw_handle(), 500) } {
+                        WAIT_OBJECT_0 => {
+                            let Some(settings) = settings.upgrade() else { break };
+                            settings.store(true, Ordering::Relaxed);
+                            let handle = hwnd.load(Ordering::Relaxed) as windows_sys::Win32::Foundation::HWND;
+                            unsafe {
+                                if !handle.is_null()
+                                    && (IsWindowVisible(handle) == 0 || IsIconic(handle) != 0)
+                                {
+                                    ShowWindowAsync(handle, SW_RESTORE);
+                                }
+                            }
+                            if let Ok(ctx) = repaint.lock() {
+                                if let Some(ctx) = ctx.as_ref() {
+                                    ctx.request_repaint();
+                                }
+                            }
+                        }
+                        WAIT_TIMEOUT => {}
+                        _ => break,
+                    }
+                }
+            })?;
+        Ok(())
+    }
+
+    fn poll(&self, ctx: &egui::Context, allow_close: &mut bool) -> bool {
+        let settings = self.settings.swap(false, Ordering::Relaxed);
+        if self.show.swap(false, Ordering::Relaxed) || settings {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
@@ -105,6 +155,7 @@ impl TrayController {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
+        settings
     }
 }
 
@@ -115,7 +166,7 @@ struct TrayController;
 impl TrayController {
     fn new(_: Vec<u8>, _: u32, _: u32) -> anyhow::Result<Self> { Ok(Self) }
     fn attach_context(&self, _: &eframe::CreationContext<'_>) {}
-    fn poll(&self, _: &egui::Context, _: &mut bool) {}
+    fn poll(&self, _: &egui::Context, _: &mut bool) -> bool { false }
 }
 use thodtalk::{
     audio::Audio,
@@ -4086,7 +4137,9 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         thodtalk::diagnostics::enable(self.profile.debug_terminal, self.store.root.clone());
         thodtalk::diagnostics::window(ctx, &mut self.profile.debug_terminal);
-        self.tray.poll(ctx, &mut self.allow_close);
+        if self.tray.poll(ctx, &mut self.allow_close) && !self.editing {
+            self.open_settings();
+        }
         ctx.request_repaint_after(Duration::from_millis(250));
         self.tick(ctx);
         self.dropped_files(ctx);
@@ -4476,7 +4529,7 @@ fn main() {
         }
         return;
     }
-    if let Err(error) = run() {
+    if let Err(error) = run(args.get(1).is_some_and(|arg| arg == "--settings")) {
         rfd::MessageDialog::new()
             .set_title("ThodTalk")
             .set_description(format!("{error:#}"))
@@ -4484,16 +4537,72 @@ fn main() {
             .show();
     }
 }
-fn run() -> anyhow::Result<()> {
+
+#[cfg(windows)]
+fn settings_event_name(root: &std::path::Path) -> std::io::Result<Vec<u16>> {
+    use sha2::{Digest, Sha256};
+    use std::os::windows::ffi::OsStrExt;
+
+    let root = root.canonicalize()?;
+    let mut hash = Sha256::new();
+    for unit in root.as_os_str().encode_wide() {
+        hash.update(unit.to_le_bytes());
+    }
+    Ok(format!("Local\\ThodTalk.Settings.{:x}", hash.finalize())
+        .encode_utf16()
+        .chain([0])
+        .collect())
+}
+
+#[cfg(windows)]
+fn create_settings_event(name: &[u16]) -> std::io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::System::Threading::CreateEventW;
+
+    let handle = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) })
+}
+
+fn run(open_settings: bool) -> anyhow::Result<()> {
     let store = Store::open(Store::default_path()?)?;
     std::fs::create_dir_all(store.root.join("runtime"))?;
+    // Keep the event alive while the primary window is still starting.
+    #[cfg(windows)]
+    let event_name = settings_event_name(&store.root)?;
+    #[cfg(windows)]
+    let event = create_settings_event(&event_name)?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(store.root.join("runtime/instance.lock"))?;
-    lock.try_lock()
-        .map_err(|_| anyhow::anyhow!("ThodTalk уже открыт с этим профилем"))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            #[cfg(windows)]
+            if open_settings {
+                use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+                use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+
+                // An older running version has no listener. Drop our own handle
+                // before checking whether the primary instance holds the event.
+                drop(event);
+                let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, event_name.as_ptr()) };
+                if !handle.is_null() {
+                    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+                    if unsafe { SetEvent(handle.as_raw_handle()) } == 0 {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    return Ok(());
+                }
+            }
+            anyhow::bail!("ThodTalk уже открыт с этим профилем");
+        }
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
     let image = image::load_from_memory(include_bytes!(concat!(env!("OUT_DIR"), "/icon.png")))?
         .into_rgba8();
     let icon_width = image.width();
@@ -4505,6 +4614,8 @@ fn run() -> anyhow::Result<()> {
         rgba: icon_rgba.clone(),
     };
     let tray = TrayController::new(icon_rgba, icon_width, icon_height)?;
+    #[cfg(windows)]
+    tray.listen_for_settings(event)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_icon(icon)
@@ -4515,7 +4626,13 @@ fn run() -> anyhow::Result<()> {
     eframe::run_native(
         "ThodTalk",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, store, lock, tray)))),
+        Box::new(move |cc| {
+            let mut app = App::new(cc, store, lock, tray);
+            if open_settings && !app.editing {
+                app.open_settings();
+            }
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
